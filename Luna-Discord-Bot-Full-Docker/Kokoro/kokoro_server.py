@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""
+Kokoro TTS server — OpenAI-compatible /v1/audio/speech endpoint
+
+Setup:
+  source ~/kokoro-env/bin/activate
+  pip install kokoro>=0.9.4 soundfile fastapi uvicorn
+  apt-get install espeak-ng  # or: brew install espeak-ng
+Run: python3 kokoro_server.py
+
+Environment:
+  KOKORO_VOICE            default voice (af_heart)
+  KOKORO_THREADS          torch intra-op threads (default 2)
+  KOKORO_MAX_CONCURRENCY  simultaneous syntheses (default 2)
+  KOKORO_DEVICE           auto (default: cuda > mps > cpu), or cuda / mps / cpu
+"""
+import asyncio
+import importlib.metadata
+import io
+import os
+import queue
+import shutil
+import struct
+import tempfile
+import threading
+
+import numpy as np
+import soundfile as sf
+import torch
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response, StreamingResponse
+from kokoro import KPipeline
+from pydantic import BaseModel
+
+# ── CPU budget ────────────────────────────────────────────────────────────────
+#
+# torch defaults to one thread per core. On a machine also running an LLM, a
+# Whisper server and the bot itself, that means every TTS request briefly tries
+# to own the whole CPU — and because TTS is prefetched (sentence N+1 renders
+# while N plays) this collides with the LLM still generating sentence N+2.
+# Capping here costs a little single-request latency and buys a lot of
+# system-wide predictability.
+#
+# Set before any inference runs; torch ignores later changes in some builds.
+torch.set_num_threads(int(os.getenv("KOKORO_THREADS", "2")))
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass  # already initialised; harmless
+
+app = FastAPI()
+
+
+def _pick_device() -> str:
+    """
+    Choose the torch device explicitly.
+
+    kokoro 0.9.4 (the current PyPI release) defaults to 'cuda' if available,
+    otherwise 'cpu' — it never selects MPS on its own, regardless of
+    PYTORCH_ENABLE_MPS_FALLBACK. Without passing device= here, the Apple
+    Silicon "Metal" path silently ran on CPU.
+    """
+    requested = os.getenv("KOKORO_DEVICE", "auto").lower()
+    if requested != "auto":
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+DEVICE = _pick_device()
+
+
+# Well under libespeak-ng's 160-byte path buffer: it also appends subpaths
+# like "/voices/..." to this. 136 chars is known to work; 166 is known to fail.
+_ESPEAK_MAX_DATA_PATH = 140
+
+
+def _ensure_short_espeak_data_path() -> None:
+    """
+    Keep espeak-ng's data path short enough for libespeak-ng to accept.
+
+    misaki points espeak at the espeak-ng-data bundled inside the
+    espeakng_loader wheel, i.e. deep inside the venv. libespeak-ng copies that
+    path into a fixed 160-byte buffer; if it does not fit it silently falls
+    back to the path compiled in on the wheel's build machine, and the first
+    synthesis dies with
+
+        Error processing file '<build-directory>/espeakng-loader/.../phontab'
+
+    so a venv nested a few directories too deep breaks Kokoro outright. When
+    the bundled path is too long, copy the data (~19 MB, once per version)
+    under the temp dir and point espeak there instead.
+    """
+    import espeakng_loader
+    import misaki.espeak  # noqa: F401 — sets the default path we override
+    from phonemizer.backend.espeak.wrapper import EspeakWrapper
+
+    src = espeakng_loader.get_data_path()
+    if len(src) <= _ESPEAK_MAX_DATA_PATH:
+        return
+
+    # Versioned, so upgrading espeakng-loader never reuses stale data.
+    version = importlib.metadata.version("espeakng-loader")
+    dst = os.path.join(tempfile.gettempdir(), f"kokoro-espeak-ng-data-{version}")
+    if len(dst) > _ESPEAK_MAX_DATA_PATH:
+        dst = f"/tmp/kokoro-espeak-ng-data-{version}"
+
+    if not os.path.isdir(dst):
+        # Copy beside the target and rename, so an interrupted copy is never
+        # mistaken for a complete one on the next start.
+        staging = tempfile.mkdtemp(dir=os.path.dirname(dst))
+        shutil.copytree(src, os.path.join(staging, "data"))
+        try:
+            os.rename(os.path.join(staging, "data"), dst)
+        except OSError:
+            pass  # another process won the race; its copy is complete
+        shutil.rmtree(staging, ignore_errors=True)
+
+    EspeakWrapper.set_data_path(dst)
+    print(f"[kokoro] espeak-ng data path is {len(src)} chars (limit "
+          f"{_ESPEAK_MAX_DATA_PATH}); using copy at {dst}", flush=True)
+
+
+_ensure_short_espeak_data_path()
+
+# 'a' = American English, 'b' = British English
+if os.environ.get("ALLOW_EXTERNAL_ASSETS") != "true":
+    raise PermissionError("External assets require rights review and explicit ALLOW_EXTERNAL_ASSETS=true")
+pipeline = KPipeline(lang_code='a', device=DEVICE)
+
+# The MPS backend is not safe for concurrent inference from several threads on
+# one model, and KOKORO_MAX_CONCURRENCY lets several syntheses run at once.
+# Serialise each generator step on MPS; requests still interleave chunk by
+# chunk, so the prefetch pipeline keeps overlapping with playback.
+_infer_lock = threading.Lock() if DEVICE == "mps" else None
+
+
+def _synth(text: str, voice: str, speed: float):
+    """Yields audio chunks from the pipeline, locking per step on MPS."""
+    it = iter(pipeline(text, voice=voice, speed=speed))
+    while True:
+        if _infer_lock is None:
+            result = next(it, None)
+        else:
+            with _infer_lock:
+                result = next(it, None)
+        if result is None:
+            return
+        yield result.audio
+
+# Good female voices to try:
+# af_bella, af_sarah, af_sky, af_nicole, af_heart
+DEFAULT_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+
+SAMPLE_RATE = 24000
+
+# Bounds how many syntheses run at once. Without it, N speakers each prefetching
+# sentence N+1 can put an unbounded number of torch graphs in flight, and every
+# one of them gets slower — including the sentence that is about to play.
+MAX_CONCURRENCY = int(os.getenv("KOKORO_MAX_CONCURRENCY", "2"))
+_sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+
+class TTSRequest(BaseModel):
+    input: str
+    voice: str = DEFAULT_VOICE
+    speed: float = 1.0
+    stream: bool = False
+
+
+def make_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """
+    Build a WAV header with an unknown data size (0xFFFFFFFF).
+    This is the standard trick for streaming WAV — players start decoding
+    immediately without needing to know the total file size up front.
+    """
+    byte_rate    = sample_rate * num_channels * bits_per_sample // 8
+    block_align  = num_channels * bits_per_sample // 8
+    # Use max uint32 for sizes since we don't know them yet
+    data_size    = 0xFFFFFFFF
+    riff_size    = 0xFFFFFFFF
+
+    header = struct.pack('<4sI4s', b'RIFF', riff_size, b'WAVE')
+    fmt    = struct.pack('<4sIHHIIHH',
+        b'fmt ', 16,            # chunk size
+        1,                      # PCM format
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+    )
+    data   = struct.pack('<4sI', b'data', data_size)
+    return header + fmt + data
+
+
+def pcm_float(audio) -> np.ndarray:
+    """Tensor (possibly on MPS/CUDA) or numpy array -> float32 numpy on CPU."""
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu().numpy()
+    return audio
+
+
+def pcm_chunk(audio) -> bytes:
+    """Convert float32 Tensor or numpy array to int16 PCM bytes."""
+    clipped = np.clip(pcm_float(audio), -1.0, 1.0)
+    return (clipped * 32767).astype(np.int16).tobytes()
+
+
+_SENTINEL = object()
+
+
+def _put(q, item, cancel: threading.Event) -> bool:
+    """Blocking put that gives up once the consumer has gone away."""
+    while not cancel.is_set():
+        try:
+            q.put(item, timeout=0.1)
+            return True
+        except queue.Full:
+            pass
+    return False
+
+
+def _synthesize_into(q, text: str, voice: str, speed: float, cancel: threading.Event) -> None:
+    """
+    Runs the Kokoro generator on a worker thread, pushing PCM chunks onto `q`.
+
+    This exists because `pipeline(...)` is a SYNCHRONOUS generator doing torch
+    inference. Iterating it inside an `async def` — as this server previously
+    did — runs that inference *on the event loop*. For the duration of every
+    synthesis the server accepts no connections, streams no other response and
+    answers no health check. The client's prefetch pipeline therefore did not
+    actually overlap: sentence N+1 could not start until N finished, and a
+    second speaker's request waited behind both.
+
+    `cancel` is set when the client disconnects (barge-in, timeout), so the
+    worker stops at the next chunk instead of rendering audio nobody will hear
+    while holding a concurrency slot.
+    """
+    try:
+        for audio in _synth(text, voice, speed):
+            if cancel.is_set():
+                break
+            if audio is not None and not _put(q, pcm_chunk(audio), cancel):
+                break
+    except Exception as exc:                      # noqa: BLE001 — forwarded to caller
+        _put(q, exc, cancel)
+    finally:
+        # A pending executor q.get() must always be released. If the queue is
+        # full, that get returns immediately anyway.
+        if not _put(q, _SENTINEL, cancel):
+            try:
+                q.put_nowait(_SENTINEL)
+            except queue.Full:
+                pass
+
+
+async def stream_audio(input_text: str, voice: str, speed: float):
+    """
+    Async generator: WAV header, then PCM chunks as the worker thread produces
+    them. The event loop stays free between chunks.
+    """
+    async with _sem:
+        yield make_wav_header(SAMPLE_RATE)
+
+        # maxsize applies backpressure: if Discord playback is slower than
+        # synthesis, the worker parks instead of buffering a whole utterance.
+        q = queue.Queue(maxsize=8)
+        cancel = threading.Event()
+        loop = asyncio.get_running_loop()
+
+        worker = threading.Thread(
+            target=_synthesize_into,
+            args=(q, input_text, voice, speed, cancel),
+            daemon=True,
+        )
+        worker.start()
+
+        try:
+            while True:
+                item = await loop.run_in_executor(None, q.get)
+                if item is _SENTINEL:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            # Tell the worker to stop rather than draining here. The previous
+            # synchronous drain loop ran ON the event loop and blocked the whole
+            # server until the abandoned sentence finished rendering — on every
+            # barge-in.
+            cancel.set()
+
+
+@app.post("/v1/audio/speech")
+async def text_to_speech(req: TTSRequest):
+    if not req.input or not req.input.strip():
+        raise HTTPException(status_code=400, detail="input is empty")
+
+    # ── Streaming mode ────────────────────────────────────────────────────────
+    # Returns WAV header + PCM chunks as they're generated.
+    # Node.js receives and plays audio before generation is complete,
+    # eliminating the wait-for-full-audio latency.
+    if req.stream:
+        return StreamingResponse(
+            stream_audio(req.input, req.voice, req.speed),
+            media_type="audio/wav",
+        )
+
+    # ── Non-streaming mode (original behaviour) ───────────────────────────────
+    def _render():
+        chunks = [pcm_float(a) for a in _synth(req.input, req.voice, req.speed)
+                  if a is not None]
+        if not chunks:
+            return None
+        buf = io.BytesIO()
+        sf.write(buf, np.concatenate(chunks), SAMPLE_RATE, format='WAV')
+        return buf.getvalue()
+
+    try:
+        # Off the event loop, for the same reason as the streaming path.
+        async with _sem:
+            data = await asyncio.to_thread(_render)
+    except Exception as exc:                      # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    if data is None:
+        raise HTTPException(status_code=500, detail="No audio generated")
+    return Response(content=data, media_type="audio/wav")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "voice": DEFAULT_VOICE}
+
+
+def warmup() -> None:
+    """
+    Render one short phrase at import time.
+
+    The Dockerfile pre-downloads the model, but the first *inference* still pays
+    lazy weight materialisation, allocator warm-up and espeak-ng dictionary
+    load — on the order of a second or two. Paying it here means the container
+    is not reported healthy until it can actually answer fast, so the first
+    thing a user says is not also the slowest thing Luna ever says.
+    """
+    try:
+        for _ in _synth("Ready.", DEFAULT_VOICE, 1.0):
+            pass
+        print(f"[kokoro] warm — device={DEVICE}, threads={torch.get_num_threads()}, "
+              f"concurrency={MAX_CONCURRENCY}, voice={DEFAULT_VOICE}", flush=True)
+    except Exception as exc:                      # noqa: BLE001
+        print(f"[kokoro] warmup failed (continuing): {exc}", flush=True)
+
+
+warmup()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting Kokoro TTS server on http://localhost:8880")
+    print(f"Default voice: {DEFAULT_VOICE}")
+    uvicorn.run(app, host="0.0.0.0", port=8880)

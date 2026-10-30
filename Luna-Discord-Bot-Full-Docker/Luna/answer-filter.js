@@ -1,0 +1,214 @@
+// ─── Answer filter ────────────────────────────────────────────────────────────
+//
+// Decides which parts of the LLM's streamed answer Luna says out loud. It sees
+// LM Studio's stream events (event) and the answer text sentence by sentence
+// (text), and for each sentence either speaks it now, holds it, or drops it.
+//
+// Why anything is held or dropped at all: the model sometimes puts its own
+// planning into the visible answer, and every visible sentence goes straight
+// to TTS. Three known shapes:
+//
+//   narration      "I'll search for that." / "The results were irrelevant,
+//                  let me try again." — text written just before a search.
+//   leaked         after a search the model is meant to reason (LM Studio
+//   reasoning      sends reasoning.start) and then answer; sometimes it does
+//                  that thinking in the visible text and ends it with
+//                  "</think>". Luna once spoke a draft answer, the tag, then
+//                  the answer again.
+//   tool call      "<tool_call><function=…>" — the model wanted a tool it was
+//   as text        not offered. Never spoken; the caller retries.
+//   planning       with reasoning off, Qwen sometimes writes its plan as the
+//   aloud          answer: "[thinking] Okay, the user wants one argument for
+//                  and one against… I should provide a balanced summary…
+//                  Argument For: … I will formulate these clearly." and then
+//                  the answer. Luna read all of it out.
+//
+// States:
+//
+//   speaking     sentences are spoken as they arrive (the normal case)
+//   holding      everything waits for the end of the answer — used when the
+//                model cannot reason (reasoning off) but may search, so any
+//                text may turn out to be narration
+//   planning     the answer opened like a plan ("[thinking]", "Okay, the user
+//                wants…"): everything waits for the end, then what comes
+//                before the plan's last sentence is dropped (see PLAN_LINE)
+//   unsure       after a search with no reasoning yet, or after a stray
+//                "<think>": text may be reasoning. Held until reasoning.start
+//                (it was an answer: spoken) or "</think>" (it was reasoning:
+//                dropped) or the end (it was an answer: spoken)
+//
+// Rules, in any state:
+//   - a search starting drops whatever is pending: text written just before
+//     a search is narration;
+//   - "</think>" drops whatever is pending and the text before the tag;
+//   - <think>/</think> tags are never spoken;
+//   - markdown is removed (see speakable): the model is told not to use it,
+//     but searched answers still come back with **bold** and lists, and TTS
+//     would read the asterisks or stumble on them;
+//   - text with no letters or digits ("." on its own) is ignored.
+//
+// The normal order — search, reasoning, answer — never holds anything, so
+// ordinary answers are not delayed.
+
+const THINK_TAG     = /<\/?think>/i;
+const THINK_TAG_ALL = /<\/?think>/gi;
+// A tool call written out as text (Qwen's <tool_call> / <function=...> format).
+const FAKE_TOOL_CALL = /<\/?tool_call>|<function[=\s>]|<\/function>/i;
+
+const hasWords = text => /[\p{L}\p{N}]/u.test(text);
+
+// How a plan written as the answer starts: a [thinking]-style tag, or talk
+// about "the user". Only the first sentence of an answer is checked, so an
+// answer that mentions "the user" later is never held.
+const PLAN_START = /^\s*\[(?:thinking|thinks?|thoughts?|reasoning|plan(?:ning)?)\]|^\s*(?:(?:okay|ok|alright|so|hmm+|right)[,.!]?\s+)?(?:so\s+)?the user(?:'s|\s+(?:wants|is|asks|asked|would|just|seems|needs|said|says))\b/i;
+// A sentence of the plan itself, not the answer. The plan ends at the last
+// of these; the answer is what follows.
+const PLAN_LINE = /\bthe user\b|^\s*\[(?:thinking|thinks?|thoughts?|reasoning|plan(?:ning)?)\]|^\s*(?:i should|i need to|i will|i'll|i must|i can|let me|let's (?:draft|structure|plan|think)|my (?:answer|response|reply)|draft|plan|structure|final (?:answer|response))\b|\b(?:formulate|keep it (?:natural|concise|conversational|short|brief)|no markdown|in my (?:answer|response|reply))\b/i;
+// The plan's own tags ("[thinking]") are never spoken, even when kept.
+const PLAN_TAG = /\[(?:thinking|thinks?|thoughts?|reasoning|plan(?:ning)?)\]\s*/gi;
+
+// Markdown → plain speech. Formatting markers go, their text stays:
+//   **bold** __bold__ *italic* _italic_ `code`  →  bold bold italic italic code
+//   [text](https://…)                           →  text
+//   "# Heading", "- item", "1. item", "> quote" at the start of a line → marker gone
+// plus any leftover ** or __ or lone * touching a word (a sentence can split
+// inside a bold or italic phrase: "*O Brother, Where Art Thou?" / "*, which…").
+// A * between digits or spaces stays ("2 * 3").
+// Untouched: ElevenLabs audio tags like [laughs] (no "(url)" after them) and
+// underscores inside words (snake_case).
+function stripMarkdown(text) {
+  return text
+    .replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, '$1')
+    .replace(/(\*\*|__)(?=\S)([\s\S]*?\S)\1/g, '$2')
+    .replace(/(^|[^\w*])\*(?=\S)([^*\n]*?\S)\*(?![\w*])/g, '$1$2')
+    .replace(/(^|[^\w])_(?=\S)([^_\n]*?\S)_(?!\w)/g, '$1$2')
+    .replace(/`([^`\n]*)`/g, '$1')
+    .replace(/^[ \t]*(?:#{1,6}[ \t]+|>[ \t]?|[-*+][ \t]+|\d+[.)][ \t]+)/gm, '')
+    .replace(/\*{2,}|_{2,}|`+/g, '')
+    .replace(/(?<![\d\s])\*|\*(?![\d\s])/g, '');
+}
+
+// Emoji are not spoken (the prompt asks for none, but "some🍦 scooped" got
+// through). \p{Extended_Pictographic} is Unicode's own list of emoji, so
+// accented letters, °, € and dashes are untouched; the rest are the invisible
+// pieces emoji are built from: flag letters (🇺🇸), skin tones (👍🏽), the
+// joiner (👩‍💻), the emoji-style selector (❤️) and the keycap mark (1️⃣).
+// ©, ® and ™ are on Unicode's list too, but they are ordinary text symbols.
+const EMOJI = /(?![\u00A9\u00AE\u2122])[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}\u{1F3FB}-\u{1F3FF}\u200D\uFE0F\u20E3]/gu;
+
+function stripEmoji(text) {
+  return text.replace(EMOJI, ' ');
+}
+
+// What TTS gets: no reasoning tags, no markdown, no emoji, single spaces.
+const speakable = text => stripEmoji(stripMarkdown(text.replace(THINK_TAG_ALL, ' ').replace(PLAN_TAG, ' '))).replace(/\s+/g, ' ').trim();
+
+// options:
+//   reasoning     false when the model answers without reasoning (reasoning
+//                 off): it then has no reasoning to leak, so "unsure" is
+//                 never entered
+//   holdUntilEnd  start in "holding" (reasoning-off answers that may search)
+//   speak(text)   say a sentence
+//   drop(kind, text)  a sentence will not be said: 'narration' | 'leaked reasoning' | 'planning'
+//   cleaned(raw)  a sentence had to be cleaned up before it could be said (the
+//                 model's text as written, for the log)
+//
+// text(sentence) returns 'ignored' (nothing to say), 'tool-call-as-text' (the
+// caller should stop this answer) or 'ok'.
+function createAnswerFilter({ reasoning = true, holdUntilEnd = false, speak, drop = () => {}, cleaned = () => {} }) {
+  const resting = holdUntilEnd ? 'holding' : 'speaking';
+  let state = resting;
+  let pending = [];
+  let started = false;   // a sentence with words has arrived (spoken or held)
+  let plan = [];         // sentences, as written, while planning
+
+  const release = () => {
+    const out = pending;
+    pending = [];
+    out.forEach(speak);
+  };
+  const discard = (kind, extra = []) => {
+    const lost = [...pending, ...extra].filter(hasWords);
+    pending = [];
+    if (lost.length) drop(kind, lost.join(' ').replace(/\s+/g, ' '));
+  };
+  const say = raw => {
+    if (!started && hasWords(raw) && PLAN_START.test(raw)) state = 'planning';
+    started = started || hasWords(raw);
+    if (state === 'planning') { plan.push(raw); return; }
+    const sentence = speakable(raw);
+    if (!hasWords(sentence)) return;
+    if (sentence !== raw.replace(/\s+/g, ' ').trim()) cleaned(raw);
+    if (state === 'speaking') speak(sentence);
+    else pending.push(sentence);
+  };
+
+  return {
+    get state() { return state; },
+
+    event(e) {
+      if (e.type === 'tool_call.start') {
+        if (state === 'planning') { discard('narration', plan.map(speakable)); plan = []; state = resting; return; }
+        discard('narration');
+      } else if (e.type === 'tool_call.success') {
+        if (reasoning && state === 'speaking') state = 'unsure';
+      } else if (e.type === 'reasoning.start' && state === 'unsure') {
+        // Reasoning was parsed normally after all: what was held is answer.
+        state = resting;
+        if (state === 'speaking') release();
+      }
+    },
+
+    text(sentence) {
+      if (!hasWords(sentence)) return 'ignored';
+      if (FAKE_TOOL_CALL.test(sentence)) return 'tool-call-as-text';
+
+      if (THINK_TAG.test(sentence)) {
+        const closing = sentence.match(/^([\s\S]*)<\/think>([\s\S]*)$/i);
+        if (closing) {
+          discard('leaked reasoning', [speakable(closing[1])]);
+          state = resting;
+          say(closing[2]);
+          return 'ok';
+        }
+        const opening = sentence.match(/^([\s\S]*?)<think>([\s\S]*)$/i);
+        if (opening && reasoning) {
+          say(opening[1]);
+          state = 'unsure';
+          say(opening[2]);
+          return 'ok';
+        }
+        say(sentence);
+        return 'ok';
+      }
+
+      say(sentence);
+      return 'ok';
+    },
+
+    // The answer is complete: anything still held was answer, not narration
+    // or reasoning, so say it.
+    end() {
+      if (state === 'planning') {
+        // The plan ends at its last plan-like sentence; the rest is answer.
+        const last = plan.reduce((at, raw, i) => (PLAN_LINE.test(raw) ? i : at), 0);
+        let lost = plan.slice(0, last + 1), answer = plan.slice(last + 1);
+        plan = [];
+        state = resting;
+        // Nothing after the plan: it ended on a plan line. Saying nothing
+        // would leave them waiting in silence, so say its notes instead (what
+        // wasn't a plan line).
+        if (!answer.some(hasWords)) {
+          answer = lost.filter(raw => !PLAN_LINE.test(raw));
+          lost = lost.filter(raw => PLAN_LINE.test(raw));
+        }
+        const dropped = lost.map(speakable).filter(hasWords).join(' ').replace(/\s+/g, ' ');
+        if (dropped) drop('planning', dropped);
+        answer.forEach(say);
+      }
+      release();
+    },
+  };
+}
+
+module.exports = { createAnswerFilter, stripMarkdown, stripEmoji };

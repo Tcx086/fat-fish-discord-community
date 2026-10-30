@@ -1,0 +1,14 @@
+{
+  "scope": "Source-only snapshot; prior private Git objects and metadata are not imported.",
+  "luna_upstream": "https://github.com/smakus/luna-discord-ai-voice-chatbot",
+  "luna_reference_revision": "6dbad1645077c280a47dc22ba3dd6d296dde7032",
+  "luna_license": "MIT; Copyright (c) 2026 smakus",
+  "openwakeword": "https://github.com/dscripka/openWakeWord",
+  "adapted_file": "Luna-Discord-Bot-Full-Docker/Luna/wakeword.js",
+  "openwakeword_license": "Apache-2.0; Copyright 2022 David Scripka. All rights reserved.",
+  "openwakeword_verification_revision": "368c03716d1e92591906a84949bc477f3a834455",
+  "limitations": [
+    "The original port revision is not recorded; the verification revision is not asserted as its origin.",
+    "Maintainer attestation of unrecorded borrowed source remains pending."
+  ]
+}

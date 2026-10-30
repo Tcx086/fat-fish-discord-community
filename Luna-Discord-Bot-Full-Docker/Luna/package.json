@@ -1,0 +1,67 @@
+{
+  "name": "fat-fish-discord",
+  "version": "0.4.0-alpha",
+  "description": "DeepSeek Discord voice assistant with optional local character TTS",
+  "main": "index.js",
+  "scripts": {
+    "test:music": "node --test test/music-*.test.js",
+    "music:example": "node scripts/create-music-example.js",
+    "chat:local": "node local-chat.js",
+    "test:v03": "node --test test/v03-*.test.js",
+    "test:v02": "node --test test/v02-*.test.js",
+    "test": "node --test test/*.test.js",
+    "test:phase0": "node --test test/phase0.test.js",
+    "test:phase0:native": "node --test test/phase0-native.test.js",
+    "test:phase1": "node --test test/phase1.test.js test/phase1-integration.test.js",
+    "diagnostic:deepseek": "node deepseek-diagnostic.js",
+    "diagnostic:voice": "node voice-diagnostic.js",
+    "start": "node index.js",
+    "test:voice": "node --test test/feiyu.test.js test/phase3-voice.test.js test/tts.test.js",
+    "test:integration": "node --test test/config.test.js test/phase0.test.js test/phase0-native.test.js test/phase1.test.js test/phase1-integration.test.js test/phase15.test.js test/tts.test.js test/phase3-voice.test.js test/feiyu.test.js test/phase2.test.js test/phase2-integration.test.js test/passive-listener.test.js test/passive-integration.test.js test/conversation-diagnostics.test.js test/unified-voice.test.js test/memory.test.js test/memory-integration.test.js test/integration-v0.test.js test/whisper-privacy.test.js",
+    "test:memory": "node --test test/memory.test.js test/memory-integration.test.js",
+    "bench:memory": "node memory/benchmark.js",
+    "test:replay": "node --test test/integration-v0.test.js test/whisper-privacy.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT AND Apache-2.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.19.2",
+    "discord-api-types": "^0.38.41",
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
+    "libsodium-wrappers": "^0.8.4",
+    "onnxruntime-node": "^1.27.0",
+    "prism-media": "^1.3.5"
+  },
+  "private": true,
+  "overrides": {
+    "@discordjs/node-pre-gyp": {
+      "tar": "7.5.21"
+    },
+    "onnxruntime-node": {
+      "adm-zip": "0.6.1"
+    },
+    "brace-expansion": "1.1.21",
+    "undici": "6.29.1"
+  },
+  "files": [
+    "*.js",
+    "*.txt",
+    "*.env.example",
+    "example.env",
+    "greetings.example.json",
+    "character/",
+    "memory/",
+    "examples/",
+    "scripts/",
+    "LICENSE",
+    "LICENSE.Apache-2.0",
+    "THIRD_PARTY_NOTICES.md"
+  ]
+}

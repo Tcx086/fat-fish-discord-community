@@ -1,0 +1,53 @@
+# Apple Silicon setup: Whisper and Kokoro both run natively on macOS with
+# Metal; only Luna stays in a container.
+#
+#   Terminal 1:  ./scripts/whisper-metal.sh
+#   Terminal 2:  ./scripts/kokoro-metal.sh
+#   Terminal 3:  docker compose -f docker-compose.metal.yml up --build
+#   Optional:    ./scripts/qwen3-tts-metal.sh   (with TTS_PROVIDER=qwen3)
+#
+# This is a standalone file rather than a `-f` override because the Whisper
+# and Kokoro services must be absent entirely, and compose merges rather than
+# removes services when overlaying.
+#
+# Kokoro used to run here too, CPU-only and capped at KOKORO_THREADS=2 /
+# KOKORO_MAX_CONCURRENCY=2 so it wouldn't starve Whisper and LM Studio for
+# cores — the same Docker-Desktop-on-Apple-Silicon limitation that motivated
+# pulling Whisper out below applies identically to Kokoro's torch backend.
+# Moving it to scripts/kokoro-metal.sh gets it onto the GPU via MPS and off
+# the CPU entirely, which is what made that throttle necessary in the first
+# place.
+
+services:
+  luna:
+    build:
+      context: ./Luna
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Luna's own MCP server (the LLM's music tools), for LM Studio on this
+    # Mac only: see README → MusicBot integration.
+    ports:
+      - "127.0.0.1:8895:8895"
+    # Server-specific files (custom greetings), read at startup: edit, then
+    # restart Luna — no rebuild.
+    volumes:
+      - ./Luna/local:/app/local:ro
+      # The wake-word log (WAKE_LOG_FILE), kept across rebuilds.
+      - ./Luna/logs:/app/logs
+      # Rendered phrases (TTS_CACHE_DIR), kept across rebuilds.
+      - ./Luna/cache:/app/cache
+    env_file:
+      - ./Luna/.env
+    environment:
+      - LM_STUDIO_URL=http://host.docker.internal:1234/api/v1/chat
+      # The host-native Metal Kokoro from scripts/kokoro-metal.sh.
+      - KOKORO_URL=http://host.docker.internal:8880/v1/audio/speech
+      # The optional host-native Qwen3-TTS from scripts/qwen3-tts-metal.sh.
+      - QWEN3_TTS_URL=http://host.docker.internal:8890/v1/audio/speech
+      # The optional host-native Chatterbox from scripts/chatterbox-metal.sh.
+      - CHATTERBOX_URL=http://host.docker.internal:8891/v1/audio/speech
+      # The host-native Metal Whisper from scripts/whisper-metal.sh.
+      - WHISPER_SERVER_URLS=http://host.docker.internal:8081/inference
+      # smakbot's now-playing endpoint (StatusApiPort, published on the host's 127.0.0.1).
+      - MUSIC_STATUS_URL=http://host.docker.internal:8896/now-playing

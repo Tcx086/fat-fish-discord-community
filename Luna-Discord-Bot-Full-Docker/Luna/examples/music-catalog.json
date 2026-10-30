@@ -1,0 +1,4 @@
+[
+  { "id": "tone-440", "title": "测试音 440 Hz", "artist": "Fat Fish synthetic fixture", "file": "tone-440.wav", "authorized": true },
+  { "id": "tone-660", "title": "测试音 660 Hz", "artist": "Fat Fish synthetic fixture", "file": "tone-660.wav", "authorized": true }
+]

@@ -1,0 +1,533 @@
+// ─── Text-to-speech providers ─────────────────────────────────────────────────
+//
+// fetchTTS(text) starts synthesis and resolves to a readable audio stream (any
+// container ffmpeg can probe — Kokoro, Qwen3-TTS and Chatterbox send WAV,
+// ElevenLabs MP3),
+// or null if every provider failed. It resolves as soon as the response headers
+// arrive, so the prefetch pipeline in voice-playback.js keeps overlapping synthesis with
+// playback.
+//
+// TTS_PROVIDER picks the preferred provider: "kokoro" (default), "qwen3",
+// "feiyu", "chatterbox" or "elevenlabs". TTS_FALLBACK (default "kokoro") is tried next, then Kokoro as a
+// last resort — e.g. ElevenLabs → Qwen3-TTS → Kokoro. TTS_FALLBACK=none
+// disables fallback. A provider that fails is handled like this:
+//
+//   - out of credits: the provider is skipped for TTS_CREDITS_RETRY_MS
+//     (12 h). Credits only come back with a top-up or the monthly reset, and
+//     a short pause flip-flopped the voice: each retry could still fit a
+//     short line into the last few credits, then failed on the next one.
+//   - bad key/voice/plan: skipped for TTS_PROVIDER_RETRY_MS (30 min).
+//   Either way it is tried again afterwards, so fixing the account brings it
+//   back without a restart.
+//   - rate limit, overload, server error, timeout: only this sentence falls
+//     back; the next one tries the preferred provider again.
+//
+// Fallback can only happen before audio starts. A stream that dies mid-sentence
+// truncates that sentence, as it always has.
+//
+// fetchTTS(text, { signal }) — aborting the signal cancels the request (no
+// fallback, resolves null), and destroying a returned stream cancels its
+// download. Used to drop sentences that will never be played.
+//
+// fetchTTS(text, { cache: true }) — a line said again and again (greetings,
+// fillers, the search heads-up): kept on disk once rendered and played from
+// there next time, in the same voice (tts-cache.js). A cached line plays even
+// while its provider is benched — out of credits, say — since it costs nothing.
+//
+// createTTS({ config, fetch, console, fs }) → { fetchTTS, fetchTTSInVoice,
+// checkElevenLabsVoice, describeTTS, expressivePrompt, pronounce }. fetch,
+// console and fs are passed in so the tests can fake them; without fs there
+// is no phrase cache.
+
+const { PassThrough } = require('stream');
+const { createTtsCache } = require('./tts-cache');
+
+// ─── Expressiveness ───────────────────────────────────────────────────────────
+//
+// Some voices act on inline audio tags — "[laugh] That's great." Each provider
+// says which tags it performs (`tags`) and what the LLM is told about them
+// (`tagPrompt`); while such a provider is the one actually in use, the LLM
+// gets that instruction (expressivePrompt()). Before a sentence goes to a
+// provider, tags it can't perform are dropped (`speakable`), so they are never
+// read out — e.g. an answer started on ElevenLabs that falls back mid-way, or
+// a custom announcement phrase. Kokoro and Qwen3-TTS perform none.
+
+const AUDIO_TAG = /\[[^\[\]\n]{1,40}\]/g;
+
+function stripAudioTags(text) {
+  return text.replace(AUDIO_TAG, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// ElevenLabs v3/v4 take free-form tags ("any"), including combined directions
+// ("[warm, laughing softly]") and pacing ("[pause]"). The LLM is shown a range
+// across emotions, reactions and delivery: shown only six examples, Qwen used
+// little else ([chuckles] was 6 of 16 tags on 24 test answers); with this list
+// it used 21 different ones, pauses and combined tags included, and still none
+// on plain facts. No limit on how many: tags where the words need them.
+const ELEVENLABS_TAG_MODELS = new Set(['eleven_v4', 'eleven_v4_turbo', 'eleven_v3', 'eleven_v3_conversational']);
+const ELEVENLABS_PROMPT =
+  'Your voice performs audio tags: short directions in square brackets, placed right before the words ' +
+  'they shape. Use them where the words alone would not carry the feeling, vary them to suit the moment, ' +
+  'and use none in plain factual answers. ' +
+  'Emotions: [excited], [playful], [curious], [thoughtful], [amazed], [proud], [warm], [sarcastic], ' +
+  '[tired], [worried], [disappointed]. Reactions: [laughs], [chuckles], [giggles], [sighs], [gasps]. ' +
+  'Delivery: [whispers], [mumbles], [pause], [short pause], [hesitates]. A tag can combine directions, ' +
+  'like [warm, laughing softly], and the tone can change partway through an answer.';
+
+// Chatterbox Turbo performs exactly the tags it was trained on (the server's
+// /health lists them). The LLM is told all of them; ElevenLabs-style spellings
+// it may still write are mapped to the nearest one, and the rest dropped.
+const CHATTERBOX_EMOTIONS = ['happy', 'sarcastic', 'surprised', 'whispering', 'angry', 'fear', 'crying', 'dramatic'];
+const CHATTERBOX_SOUNDS = ['laugh', 'chuckle', 'sigh', 'gasp', 'groan', 'sniff', 'cough', 'clear throat', 'shush'];
+const CHATTERBOX_ALIASES = {
+  laughs: 'laugh', laughing: 'laugh', giggles: 'laugh', giggle: 'laugh',
+  chuckles: 'chuckle', chuckling: 'chuckle', sighs: 'sigh', sighing: 'sigh',
+  gasps: 'gasp', groans: 'groan', sniffs: 'sniff', sniffles: 'sniff', coughs: 'cough',
+  whispers: 'whispering', whisper: 'whispering', excited: 'happy', cheerful: 'happy',
+  surprise: 'surprised', scared: 'fear', afraid: 'fear', cries: 'crying', sad: 'crying',
+};
+const tagList = names => names.map(n => `[${n}]`).join(', ');
+const CHATTERBOX_PROMPT =
+  'Your voice can perform these audio tags, written in square brackets exactly ' +
+  `as shown. Emotions: ${tagList(CHATTERBOX_EMOTIONS)}; an emotion only colors the ` +
+  'words after it, so put it at the start of a sentence, never at the end. ' +
+  `Sounds: ${tagList(CHATTERBOX_SOUNDS)}; a sound is performed where it stands. ` +
+  'Use tags wherever they genuinely fit the moment. Laugh or chuckle only at something ' +
+  'actually funny by human standards, like the punchline of a joke; never after a greeting, ' +
+  'a welcome, a question back, a kind or friendly remark, or to sound cheerful. ' +
+  'Never use any for plain facts, numbers or information. No other bracketed tags.';
+
+// The text with only the tags `tags` performs: a Set of tag names (after
+// aliases), "any", or null for none.
+function keepTags(text, tags, aliases = {}) {
+  if (tags === 'any') return text.trim();
+  if (!tags) return stripAudioTags(text);
+  return text.replace(AUDIO_TAG, tag => {
+    const name = tag.slice(1, -1).trim().toLowerCase();
+    const known = aliases[name] || name;
+    return tags.has(known) ? `[${known}]` : ' ';
+  }).replace(/\s+/g, ' ').trim();
+}
+
+// Thrown by a provider to say whether the whole provider should be benched
+// ('disable') or only this request should move on ('transient').
+class TTSError extends Error {
+  constructor(message, kind) {
+    super(message);
+    this.kind = kind;
+  }
+}
+
+// At most `max` at once; the rest wait their turn, in order. acquire()
+// resolves to a release function (safe to call more than once), or rejects
+// with a TTSError when the wait is cancelled or takes longer than waitMs.
+function createLimiter(max, label) {
+  let active = 0;
+  const waiting = [];
+  const next = () => {
+    while (active < max && waiting.length) {
+      const entry = waiting.shift();
+      entry.cleanup();
+      active++;
+      let released = false;
+      entry.resolve(() => { if (!released) { released = true; active--; next(); } });
+    }
+  };
+  return {
+    get active() { return active; },
+    acquire(cancel, waitMs) {
+      return new Promise((resolve, reject) => {
+        if (cancel?.aborted) return reject(new TTSError(`${label} request cancelled`, 'cancelled'));
+        const entry = { resolve };
+        const drop = err => { const i = waiting.indexOf(entry); if (i >= 0) { waiting.splice(i, 1); entry.cleanup(); reject(err); } };
+        const timer = setTimeout(() => drop(new TTSError(`${label} busy: no free slot after ${waitMs}ms`, 'transient')), waitMs);
+        const onCancel = () => drop(new TTSError(`${label} request cancelled`, 'cancelled'));
+        cancel?.addEventListener('abort', onCancel, { once: true });
+        entry.cleanup = () => { clearTimeout(timer); cancel?.removeEventListener('abort', onCancel); };
+        waiting.push(entry);
+        next();
+      });
+    },
+  };
+}
+
+// Error codes per https://elevenlabs.io/docs/eleven-api/resources/errors.
+// Credits used to be reported as 401 + detail.status "quota_exceeded" and are
+// now 402 + detail.code "insufficient_credits"; both are handled.
+const ELEVENLABS_CREDIT_CODES = new Set(['insufficient_credits', 'quota_exceeded']);
+const ELEVENLABS_DISABLE_CODES = new Set([
+  'payment_required', 'paid_plan_required',
+  'invalid_api_key', 'missing_api_key', 'unauthorized',
+  'detected_unusual_activity', 'insufficient_permissions',
+  'feature_not_available', 'subscription_required',
+  'voice_not_found', 'model_not_found', 'invalid_voice_id',
+]);
+
+function classifyElevenLabs(status, detail) {
+  const code = (detail && (detail.code || detail.status)) || '';
+  if (ELEVENLABS_CREDIT_CODES.has(code) || (detail && ELEVENLABS_CREDIT_CODES.has(detail.status))) return 'credits';
+  if (ELEVENLABS_DISABLE_CODES.has(code)) return 'disable';
+  if (status === 401 || status === 402 || status === 403 || status === 404) return 'disable';
+  return 'transient'; // 400 text issues, 409, 429, 5xx
+}
+
+function createTTS({ config, fetch, console, fs = null, onBodyChunk = () => {} }) {
+  // ─── Settings ─────────────────────────────────────────────────────────────
+
+  const KOKORO_URL        = config.KOKORO_URL;
+  // Unset → undefined, so the request leaves it out and the server uses its default.
+  const KOKORO_VOICE      = config.KOKORO_VOICE || undefined;
+  // Awaited inside the shared playback chain, so a hang blocks audio for every
+  // speaker — hence a timeout even on the local server.
+  const KOKORO_TIMEOUT_MS = config.KOKORO_TIMEOUT_MS;
+
+  // Qwen3-TTS speaks Kokoro's API: the existing MLX server or cuda_server.py
+  // for local CustomVoice presets. No default URL or automatic model loading.
+  const QWEN3_TTS_URL   = config.QWEN3_TTS_URL;
+  const QWEN3_TTS_VOICE = config.QWEN3_TTS_VOICE || undefined;
+  // Buffered by default: while the LLM generates on the same GPU, Qwen3-TTS
+  // renders slower than real time, and a stream that runs dry mid-sentence
+  // warbles in Discord. A whole rendered sentence plays cleanly; the cost is a
+  // pause before it. (Also why its timeout is longer.)
+  const QWEN3_TTS_STREAM     = config.QWEN3_TTS_STREAM;
+  const QWEN3_TTS_TIMEOUT_MS = config.QWEN3_TTS_TIMEOUT_MS;
+
+  // Chatterbox Turbo (Chatterbox/chatterbox_server.py, macOS only): Kokoro's API
+  // again, with a built-in voice ("default") or clones, and it performs audio
+  // tags. Buffered by default: whole sentences render 1.7x faster than real time
+  // while the LLM writes, but streamed (in small pieces) only 0.6x, which runs
+  // dry mid-sentence and cuts it off.
+  const CHATTERBOX_URL        = config.CHATTERBOX_URL;
+  const CHATTERBOX_VOICE      = config.CHATTERBOX_VOICE || undefined;
+  const CHATTERBOX_STREAM     = config.CHATTERBOX_STREAM;
+  const CHATTERBOX_TIMEOUT_MS = config.CHATTERBOX_TIMEOUT_MS;
+
+  const ELEVENLABS_API_KEY  = config.ELEVENLABS_API_KEY;
+  const ELEVENLABS_VOICE_ID = config.ELEVENLABS_VOICE_ID;
+  // v4 Turbo: real-time latency (~100 ms) and it follows audio tags.
+  const ELEVENLABS_MODEL    = config.ELEVENLABS_MODEL;
+  // MP3 works on every plan; PCM formats need Pro or above.
+  const ELEVENLABS_FORMAT   = config.ELEVENLABS_OUTPUT_FORMAT;
+  const ELEVENLABS_BASE_URL = config.ELEVENLABS_BASE_URL.replace(/\/+$/, '');
+  // Shorter than Kokoro's: a slow cloud response should fall back to Kokoro
+  // while there is still time for the sentence to play promptly.
+  const ELEVENLABS_TIMEOUT_MS = config.ELEVENLABS_TIMEOUT_MS;
+  // ElevenLabs plans cap requests in progress at once (3 on the lower tiers);
+  // one over is rejected with 429 and that sentence fell back to the other
+  // voice. Luna has several open at a time (TTS_LOOKAHEAD sentences ahead, the
+  // search heads-up, other speakers' answers), so extra ones wait for a slot.
+  const ELEVENLABS_MAX_CONCURRENCY = config.ELEVENLABS_MAX_CONCURRENCY;
+
+  const PROVIDER_RETRY_MS = config.TTS_PROVIDER_RETRY_MS;
+  const CREDITS_RETRY_MS  = config.TTS_CREDITS_RETRY_MS;
+
+  // Audio tags are passed to providers that perform them (see Expressiveness).
+  const TTS_EXPRESSIVE = config.TTS_EXPRESSIVE;
+
+  // ─── Pronunciation ──────────────────────────────────────────────────────────
+  //
+  // Names the voice says wrong, respelled the way they sound:
+  // NAME_PRONUNCIATIONS=smakus=smack-us|appa=ah-pah. Applied to everything Luna
+  // says (answers, greetings, farewells, fillers) just before the voice, so the
+  // LLM keeps writing the real name. Whole words only, any capitalisation:
+  // "smakus" and "Smakus's" change, "smakusbot" doesn't.
+  const PRONUNCIATIONS = config.NAME_PRONUNCIATIONS.flatMap(entry => {
+    const eq = entry.indexOf('=');
+    const name = entry.slice(0, eq).trim(), sound = entry.slice(eq + 1).trim();
+    if (eq < 1 || !name || !sound) {
+      console.warn(`[tts] NAME_PRONUNCIATIONS entry "${entry}" ignored — expected name=how-it-sounds`);
+      return [];
+    }
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return [{ re: new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'giu'), sound }];
+  });
+
+  function pronounce(text) {
+    return PRONUNCIATIONS.reduce((t, { re, sound }) => t.replace(re, sound), text);
+  }
+
+  // Turns a fetch Response body into a PassThrough that playTTS can consume.
+  // onDone runs once the whole body has been read, or reading stopped.
+  function pipeBody(res, label, onDone = () => {}) {
+    const passThrough = new PassThrough();
+
+    // Load-bearing. destroy(err) below emits 'error', and an 'error' event with
+    // no listener is an uncaught exception that kills the process. A listener is
+    // otherwise only attached once createAudioResource() runs in playTTS — which
+    // may be seconds away while this sentence waits behind another speaker's
+    // response, or may never happen at all if the sentence is superseded.
+    passThrough.on('error', () => {});
+    const reader = res.body.getReader();
+    // Destroying the stream (a superseded sentence) stops the download instead
+    // of reading the rest of the body into a stream nobody will play.
+    passThrough.once('close', () => { reader.cancel().catch(() => {}); onDone(); });
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) { passThrough.end(); break; }
+          if (!passThrough.destroyed) onBodyChunk(value);
+          passThrough.write(value);
+        }
+      } catch (err) {
+        // Without this the sentence truncates mid-word with nothing logged,
+        // since the 'error' listener above is intentionally a no-op.
+        if (!passThrough.destroyed) {
+          console.error(`${label} stream aborted:`, err.message);
+          passThrough.destroy(err);
+        }
+      } finally {
+        onDone();
+      }
+    })();
+    return passThrough;
+  }
+
+  // fetch() with a timeout, mapping network failures to transient errors and a
+  // caller cancellation to 'cancelled'.
+  async function request(label, url, init, timeoutMs, cancel) {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: cancel ? AbortSignal.any([timeout, cancel]) : timeout });
+    } catch (err) {
+      if (cancel && cancel.aborted) throw new TTSError(`${label} request cancelled`, 'cancelled');
+      if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+        throw new TTSError(`${label} timed out after ${timeoutMs}ms`, 'transient');
+      }
+      throw new TTSError(`${label} request failed: ${err.message}`, 'transient');
+    }
+  }
+
+  // A local server with Kokoro's /v1/audio/speech API (WAV).
+  function localProvider(name, url, voice, stream, timeoutMs, { tags = null, aliases = {}, tagPrompt = '' } = {}) {
+    return {
+      name,
+      tagPrompt,
+      speakable: text => keepTags(text, tags, aliases),
+      configured: () => Boolean(url),
+      voiceKey: () => `${name}/${voice || 'default'}/${url}`,
+      async synthesize(text, signal, metadata = {}) {
+        const res = await request(name, url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ input: text, voice, stream, ...metadata }),
+        }, timeoutMs, signal);
+        if (!res.ok) {
+          const body = await res.text();
+          // A voice that isn't installed fails every sentence until the config
+          // is fixed; anything else (e.g. still loading) is worth retrying.
+          const kind = res.status === 400 && /unknown voice/i.test(body) ? 'disable' : 'transient';
+          throw new TTSError(`${name} error ${res.status}: ${body.slice(0, 200)}`, kind);
+        }
+        return pipeBody(res, name);
+      },
+    };
+  }
+
+  const kokoro = localProvider('Kokoro', KOKORO_URL, KOKORO_VOICE, true, KOKORO_TIMEOUT_MS);
+  const feiyu = localProvider('Feiyu cute', config.FEIYU_TTS_URL, 'cute', false, config.FEIYU_TTS_TIMEOUT_MS);
+  const qwen3  = localProvider('Qwen3-TTS', QWEN3_TTS_URL, QWEN3_TTS_VOICE, QWEN3_TTS_STREAM, QWEN3_TTS_TIMEOUT_MS);
+  const chatterbox = localProvider('Chatterbox', CHATTERBOX_URL, CHATTERBOX_VOICE, CHATTERBOX_STREAM, CHATTERBOX_TIMEOUT_MS, {
+    tags: new Set([...CHATTERBOX_EMOTIONS, ...CHATTERBOX_SOUNDS]), aliases: CHATTERBOX_ALIASES, tagPrompt: CHATTERBOX_PROMPT,
+  });
+
+  const ELEVENLABS_TAGS = ELEVENLABS_TAG_MODELS.has(ELEVENLABS_MODEL);
+  const elevenlabsSlots = createLimiter(ELEVENLABS_MAX_CONCURRENCY, 'ElevenLabs');
+  const isConcurrencyLimit = (status, detail) => status === 429 &&
+    /concurren/i.test(`${detail?.code || ''} ${detail?.status || ''} ${detail?.message || ''}`);
+  const elevenlabs = {
+    name: 'ElevenLabs',
+    tagPrompt: ELEVENLABS_TAGS ? ELEVENLABS_PROMPT : '',
+    speakable: text => keepTags(text, ELEVENLABS_TAGS ? 'any' : null),
+    configured: () => Boolean(ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID),
+    voiceKey: (voiceId = ELEVENLABS_VOICE_ID) => `ElevenLabs/${ELEVENLABS_MODEL}/${voiceId}/${ELEVENLABS_FORMAT}`,
+    async synthesize(text, signal, voiceId = ELEVENLABS_VOICE_ID) {
+      const url = `${ELEVENLABS_BASE_URL}/v1/text-to-speech/${encodeURIComponent(voiceId)}` +
+        `/stream?output_format=${encodeURIComponent(ELEVENLABS_FORMAT)}`;
+      // A slot is held until ElevenLabs has sent the whole sentence: that is
+      // what it counts as "in progress".
+      for (let attempt = 1; ; attempt++) {
+        const release = await elevenlabsSlots.acquire(signal, ELEVENLABS_TIMEOUT_MS);
+        let res;
+        try {
+          res = await request('ElevenLabs', url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'xi-api-key': ELEVENLABS_API_KEY },
+            body: JSON.stringify({ text, model_id: ELEVENLABS_MODEL }),
+          }, ELEVENLABS_TIMEOUT_MS, signal);
+        } catch (err) {
+          release();
+          throw err;
+        }
+        if (res.ok) return pipeBody(res, 'ElevenLabs', release);
+        release();
+        const body = await res.text();
+        let detail = null;
+        try { detail = JSON.parse(body).detail; } catch (_) {}
+        // Something else using the same key took a slot: try once more shortly
+        // before letting this sentence go to the fallback voice.
+        if (attempt === 1 && isConcurrencyLimit(res.status, detail)) {
+          await new Promise(r => setTimeout(r, 500));
+          if (signal?.aborted) throw new TTSError('ElevenLabs request cancelled', 'cancelled');
+          continue;
+        }
+        const message = (detail && (detail.message || detail.code || detail.status)) || body.slice(0, 200);
+        throw new TTSError(`ElevenLabs error ${res.status}: ${message}`, classifyElevenLabs(res.status, detail));
+      }
+    },
+  };
+
+  const PROVIDERS = { kokoro, feiyu, qwen3, chatterbox, elevenlabs };
+
+  const preferred = PROVIDERS[config.TTS_PROVIDER.toLowerCase()];
+  const fallbackName = config.TTS_FALLBACK.toLowerCase();
+  const fallback = fallbackName === 'none' ? null : PROVIDERS[fallbackName];
+  if (fallbackName !== 'none' && !fallback) {
+    console.warn(`[tts] unknown TTS_FALLBACK "${config.TTS_FALLBACK}" — using Kokoro`);
+  }
+
+  // Providers to try, in order. An unknown or unconfigured preferred provider is
+  // dropped with a warning rather than failing every sentence.
+  const chain = [];
+  if (!preferred) {
+    console.warn(`[tts] unknown TTS_PROVIDER "${config.TTS_PROVIDER}" — using Kokoro`);
+  } else if (!preferred.configured()) {
+    console.warn(`[tts] ${preferred.name} selected but not configured — using Kokoro`);
+  } else {
+    chain.push(preferred);
+  }
+  for (const p of [fallback, kokoro]) {
+    if (p && !chain.includes(p) && p.configured()) chain.push(p);
+    if (fallback === null && chain.length) break; // TTS_FALLBACK=none
+  }
+
+  // Lines said again and again, kept once rendered (tts-cache.js).
+  const phraseCache = createTtsCache({ dir: config.TTS_CACHE_DIR, maxBytes: config.TTS_CACHE_MAX_MB * 1024 * 1024, fs, console });
+
+  const benchedUntil = new Map(); // provider -> ms timestamp
+
+  const isBenched = p => Date.now() < (benchedUntil.get(p) || 0);
+
+  function describeTTS() {
+    if (!chain.length) return 'none configured (set KOKORO_URL)';
+    const desc = chain.map(p => p.name === 'ElevenLabs' ? `ElevenLabs (${ELEVENLABS_MODEL})` : p.name)
+      .join(' → fallback ');
+    return desc + (TTS_EXPRESSIVE && chain[0].tagPrompt ? ', expressive' : '');
+  }
+
+  // The provider the next sentence will most likely go to.
+  function activeProvider() {
+    return chain.find((p, i) => !isBenched(p) || i === chain.length - 1) || null;
+  }
+
+  // Extra system-prompt text for the LLM: the audio-tag instruction of the
+  // provider in use, '' if it performs none (including while ElevenLabs is
+  // benched and Kokoro is speaking). TTS_EXPRESSIVE_PROMPT replaces the
+  // provider's own wording.
+  function expressivePrompt() {
+    const p = activeProvider();
+    if (!TTS_EXPRESSIVE || !p || !p.tagPrompt) return '';
+    return config.TTS_EXPRESSIVE_PROMPT || p.tagPrompt;
+  }
+
+  // Optional { text, expression } carries delivery metadata, never spoken labels.
+  async function fetchTTS(text, { signal, cache = false, expression, language, instruct } = {}) {
+    if (text && typeof text === 'object') {
+      expression ??= text.expression;
+      text = text.text;
+    }
+    if (typeof text !== 'string') return null;
+    const requestedLanguage = language || config.QWEN3_TTS_LANGUAGE || 'auto';
+    const metadata = {
+      expression: TTS_EXPRESSIVE ? (expression || config.QWEN3_TTS_EXPRESSION || 'neutral') : 'neutral',
+      language: ({ auto: 'Auto', chinese: 'Chinese', english: 'English' })[requestedLanguage.toLowerCase()] || requestedLanguage,
+      ...(TTS_EXPRESSIVE && instruct !== undefined ? { instruct } : {}),
+    };
+    for (let i = 0; i < chain.length; i++) {
+      if (signal && signal.aborted) return null;
+      const provider = chain[i];
+      const voiceKey = provider.voiceKey() + (provider === qwen3 ? `/${JSON.stringify(metadata)}` : '');
+      const isLast = i === chain.length - 1;
+
+      const spoken = pronounce(TTS_EXPRESSIVE ? provider.speakable(text) : stripAudioTags(text));
+      // A sentence that was only a tag ("[laughs]") has nothing left to say.
+      if (!spoken) return null;
+
+      if (cache) {
+        const cached = await phraseCache.get(voiceKey, spoken);
+        if (cached) return cached;
+      }
+
+      // A benched provider is skipped — unless it is the only one left, where
+      // trying is strictly better than certain silence.
+      if (isBenched(provider) && !isLast) continue;
+
+      try {
+        const stream = await (provider === qwen3
+          ? provider.synthesize(spoken, signal, metadata) : provider.synthesize(spoken, signal));
+        if (benchedUntil.has(provider)) {
+          benchedUntil.delete(provider);
+          console.log(`[tts] ${provider.name} is working again`);
+        }
+        return cache ? phraseCache.store(voiceKey, spoken, stream) : stream;
+      } catch (err) {
+        if (err instanceof TTSError && err.kind === 'cancelled') return null;
+        const next = chain[i + 1];
+        if (err instanceof TTSError && (err.kind === 'disable' || err.kind === 'credits') && !isLast) {
+          const alreadyBenched = isBenched(provider);
+          const pauseMs = err.kind === 'credits' ? CREDITS_RETRY_MS : PROVIDER_RETRY_MS;
+          benchedUntil.set(provider, Date.now() + pauseMs);
+          // Prefetched sentences hit the same error together; log it once.
+          if (!alreadyBenched) {
+            const span = pauseMs >= 3600000 ? `${+(pauseMs / 3600000).toFixed(1)} h` : `${Math.round(pauseMs / 60000)} min`;
+            console.error(`[tts] ${err.message} — ${err.kind === 'credits' ? 'out of credits; ' : ''}` +
+              `using ${next.name} for the next ${span}`);
+          }
+        } else {
+          console.error(`[tts] ${err.message}${next ? ` — falling back to ${next.name}` : ''}`);
+        }
+      }
+    }
+    return null;
+  }
+
+  // A line in a specific ElevenLabs voice (custom greetings). ElevenLabs only:
+  // resolves null on any problem — not configured, benched (out of credits, bad
+  // key), the request failing — so the caller can fall back to its normal line
+  // in the normal voice instead of this one in the wrong voice.
+  async function fetchTTSInVoice(text, voiceId, { signal, cache = false } = {}) {
+    if (!voiceId || !elevenlabs.configured()) return null;
+    const spoken = pronounce(TTS_EXPRESSIVE ? elevenlabs.speakable(text) : stripAudioTags(text));
+    if (!spoken) return null;
+    if (cache) {
+      const cached = await phraseCache.get(elevenlabs.voiceKey(voiceId), spoken);
+      if (cached) return cached;
+    }
+    if (isBenched(elevenlabs)) return null;
+    try {
+      const stream = await elevenlabs.synthesize(spoken, signal, voiceId);
+      return cache ? phraseCache.store(elevenlabs.voiceKey(voiceId), spoken, stream) : stream;
+    } catch (err) {
+      if (!(err instanceof TTSError && err.kind === 'cancelled')) console.error(`[tts] voice ${voiceId}: ${err.message}`);
+      return null;
+    }
+  }
+
+  // Whether an ElevenLabs voice ID exists (no credits used): its name, or null
+  // with the reason. Unknown (e.g. no network) resolves { name: null, reason }.
+  async function checkElevenLabsVoice(voiceId) {
+    if (!elevenlabs.configured()) return { name: null, reason: 'ElevenLabs is not configured' };
+    try {
+      const res = await request('ElevenLabs', `${ELEVENLABS_BASE_URL}/v1/voices/${encodeURIComponent(voiceId)}`,
+        { headers: { 'xi-api-key': ELEVENLABS_API_KEY } }, ELEVENLABS_TIMEOUT_MS);
+      if (res.ok) return { name: (await res.json()).name || voiceId };
+      return { name: null, reason: `ElevenLabs says ${res.status}` };
+    } catch (err) {
+      return { name: null, reason: err.message };
+    }
+  }
+
+  return { fetchTTS, fetchTTSInVoice, checkElevenLabsVoice, describeTTS, expressivePrompt, pronounce };
+}
+
+module.exports = { createTTS, stripAudioTags, createLimiter };

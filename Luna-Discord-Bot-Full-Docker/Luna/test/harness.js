@@ -1,0 +1,191 @@
+// Test harness for index.js.
+//
+// Runs index.js inside a vm context with every external dependency faked:
+// Discord (client, voice connections, receivers), LM Studio and Whisper (fetch),
+// TTS, and the wake-word engine. boot(env) returns { S, T, ... }:
+//   S — recorded side effects (llmRequests, tts, logs, replies, destroyed, …)
+//       and knobs the fakes read (llmScripts, transcripts, peaks, …)
+//   T — index.js internals exposed for tests (handleQuery, client, …)
+// Nothing here talks to a real service.
+const path = require('path');
+const LUNA_DIR = path.join(__dirname, '..');
+// Loads the real index.js in a vm with Discord, voice, LM Studio and TTS faked.
+const fs = require('fs'), vm = require('vm'), { EventEmitter } = require('events'), { PassThrough } = require('stream');
+
+module.exports = function boot(env = {}, overrides = {}, transport = null) {
+  const S = { replies: [], sends: [], tts: [], llmRequests: [], played: [], logs: [], destroyed: [] };
+  const log = (...a) => S.logs.push(a.join(' '));
+
+  // ── @discordjs/voice ──
+  const Status = { Signalling: 'signalling', Connecting: 'connecting', Ready: 'ready', Disconnected: 'disconnected', Destroyed: 'destroyed' };
+  class FakeConnection extends EventEmitter {
+    constructor(channelId) { super(); this.channelId = channelId; this.state = { status: Status.Signalling }; const subs = new Map(); this.receiver = { speaking: new EventEmitter(), subscriptions: subs, subscribe: (uid) => { if (subs.has(uid)) return subs.get(uid); const s = new PassThrough(); s.once('close', () => subs.delete(uid)); subs.set(uid, s); (S.audio ??= {})[uid] = s; return s; } }; }
+    setStatus(st) { this.state = { status: st }; this.emit(st); this.emit('stateChange');
+      if (st === Status.Ready && !S.holdVoiceConfirmation) S.client?.emit('voiceStateUpdate', { channelId: null },
+        { id: 'luna', guild: { id: 'g' }, channelId: this.channelId, channel: channel(this.channelId) }); }
+    subscribe() { return { unsubscribe() {} }; }
+    destroy() { if (this.state.status === Status.Destroyed) throw new Error('already destroyed'); S.destroyed.push(this.channelId); this.setStatus(Status.Destroyed); }
+  }
+  let guildConn = null;
+  const voice = {
+    VoiceConnectionStatus: Status, AudioPlayerStatus: { Playing: 'playing', Idle: 'idle' }, StreamType: { Arbitrary: 'arb' }, EndBehaviorType: { AfterSilence: 1 },
+    joinVoiceChannel: ({ channelId }) => {
+      if (S.joinFails) throw new Error('fixture join failure');
+      if (guildConn && guildConn.state.status !== Status.Destroyed) { guildConn.channelId = channelId; return guildConn; }
+      guildConn = new FakeConnection(channelId); S.lastConnection = guildConn; return guildConn;
+    },
+    entersState: (conn, st, ms) => new Promise((res, rej) => {
+      if (conn.state.status === st) return res(conn);
+      const t = setTimeout(() => rej(new Error('timeout')), Math.min(ms, 200));
+      conn.once(st, () => { clearTimeout(t); res(conn); });
+    }),
+    createAudioPlayer: () => { const p = new EventEmitter(); let playing = false; const idle = () => { if (!playing) return false; playing = false; p.emit('idle'); return true; };
+      p.play = r => { S.played.push(r.text); playing = true; p.emit('playing'); setTimeout(idle, S.playMs ?? 20); }; p.stop = idle; return p; },   // like discord.js: stop() while playing goes idle at once; when idle, nothing
+    createAudioResource: (stream) => ({ text: stream.ttsText, playbackDuration: 1200, playStream: { readableEnded: !S.audioRunsDry, destroy() {} } }),
+  };
+
+  // ── discord.js ──
+  class Client extends EventEmitter { constructor() { super(); this.user = { id: 'luna' }; S.client = this;
+    // One guild, "g": its voice channels are those anyone is in (plus S.voiceChannels), and the text channels in S.textChannels.
+    const guild = { id: 'g', voiceAdapterCreator: {}, commands: { create: async definition => { (S.registered ??= []).push(definition); } }, channels: { cache: { values: () => [
+      ...new Set([...members.keys(), ...(S.voiceChannels || [])])].map(id => channel(id)).concat((S.textChannels || []).map(name => ({
+        id: 't-' + name, name, isVoiceBased: () => false, isTextBased: () => true,
+        send: async m => { S.sends.push(`#${name}: ${m}`); return { delete: async () => {}, edit: async () => {} }; } }))) } } };
+    this.guilds = { cache: new Map([['g', guild]]) }; } login() {} destroy() { S.clientDestroyed = true; } }
+  const discord = { Events: { ClientReady: 'ready', MessageCreate: 'messageCreate', VoiceStateUpdate: 'voiceStateUpdate', Error: 'error' }, Client };
+
+  // ── tts.js ──
+  const tts = { createTTS: () => tts,
+    describeTTS: () => 'Fake', expressivePrompt: () => '',
+    // A specific ElevenLabs voice (custom greetings): S.voiceDown makes it unavailable.
+    fetchTTSInVoice: async (text, voice) => { (S.voiceTts ??= []).push({ text, voice }); if (S.voiceDown) return null;
+      const st = new PassThrough(); st.ttsText = `[voice ${voice}] ${text}`; S.tts.push({ text: st.ttsText }); return st; },
+    checkElevenLabsVoice: async voice => (S.badVoices || []).includes(voice) ? { name: null, reason: 'ElevenLabs says 404' } : { name: 'Some Voice' },
+    fetchTTS: (text, opts = {}) => {
+      const rec = { text, signal: opts.signal, cache: opts.cache, destroyed: false };
+      S.tts.push(rec);
+      return new Promise(res => setTimeout(() => {
+        if (opts.signal?.aborted) return res(null);
+        const st = new PassThrough(); st.ttsText = text; st.on('close', () => { rec.destroyed = true; }); res(st);
+      }, S.ttsMs ?? 10));
+    },
+  };
+
+  const mods = {
+    './music-catalog': require(path.join(LUNA_DIR, 'music-catalog.js')),
+    './music-engine': require(path.join(LUNA_DIR, 'music-engine.js')),
+    './music-commands': require(path.join(LUNA_DIR, 'music-commands.js')),
+    './audio-coordinator': require(path.join(LUNA_DIR, 'audio-coordinator.js')),
+    './conversation-core': require(path.join(LUNA_DIR, 'conversation-core.js')),
+    './conversation-runtime': require(path.join(LUNA_DIR, 'conversation-runtime.js')),
+    './search-tools': require(path.join(LUNA_DIR, 'search-tools.js')),
+    './discord-text-adapter': require(path.join(LUNA_DIR, 'discord-text-adapter.js')),
+    './memory/engine': require(path.join(LUNA_DIR, 'memory/engine.js')),
+    './memory/commands': require(path.join(LUNA_DIR, 'memory/commands.js')),
+    './deepseek': require(path.join(LUNA_DIR, 'deepseek.js')),
+    './deepseek-config': require(path.join(LUNA_DIR, 'deepseek-config.js')),
+    './voice-conversation': require(path.join(LUNA_DIR, 'voice-conversation.js')),
+    './passive-listener': require(path.join(LUNA_DIR, 'passive-listener.js')),
+    './conversation-config': require(path.join(LUNA_DIR, 'conversation-config.js')),
+    './deepseek-response': require(path.join(LUNA_DIR, 'deepseek-response.js')),
+    './conversation-diagnostics': require(path.join(LUNA_DIR, 'conversation-diagnostics.js')),
+    '@discordjs/voice': voice, 'discord.js': discord, 'discord-api-types/v10': { GatewayIntentBits: {} },
+    'prism-media': { opus: { Decoder: class extends PassThrough {} } }, '@discordjs/opus': { OpusEncoder: class { decode(b) { if (b[0] === 0xBA && b[1] === 0xD0) throw new Error('The compressed data passed is corrupted'); return b; } } }, dotenv: { config() {} },
+    './wakeword': { WakeWordEngine: { load: async (opts) => { S.wakeLoad = opts; await new Promise(r => setTimeout(r, S.wakeLoadMs ?? 0));
+      return { createStream: (opts) => { (S.wake ??= {})[opts.label] = opts;
+        return { write: () => Promise.resolve(null), takePeak: () => { const p = (S.peaks ??= {})[opts.label] || 0; S.peaks[opts.label] = 0; return p; }, takeHealthPeak: () => 0, close() {}, exportGainState: () => ({}), chunksProcessed: 0, queueDepth: 0, lastGain: 1, lastRms: 0 }; } }; } } },
+    fs: { promises: {   // the wake-word log (wake-log.js): S.wakeLog has its lines, S.wakeLogDown makes writes fail
+      mkdir: async () => {}, stat: async () => ({ size: 0 }), rename: async () => {},
+      readFile: async file => file.endsWith('.1') ? '' : (S.wakeLog || []).map(({ file: _, ...e }) => JSON.stringify(e) + '\n').join(''),
+      appendFile: async (file, line) => { if (S.wakeLogDown) throw new Error('EROFS: read-only file system'); (S.wakeLog ??= []).push({ file, ...JSON.parse(line) }); } } },
+    './wake-log': require(path.join(LUNA_DIR, 'wake-log.js')),
+    http: { createServer: handler => { S.mcpHandler = handler; const srv = { on: () => srv, listen: (port, host, cb) => { S.mcpPort = port; cb && cb(); return srv; } }; return srv; } },
+    './mcp-server': require(path.join(LUNA_DIR, 'mcp-server.js')), './llm-tools': require(path.join(LUNA_DIR, 'llm-tools.js')), './text-chat': require(path.join(LUNA_DIR, 'text-chat.js')), './greetings': require(path.join(LUNA_DIR, 'greetings.js')),
+    './tts': tts, './answer-filter': require(path.join(LUNA_DIR, 'answer-filter.js')), './voice-input': require(path.join(LUNA_DIR, 'voice-input.js')), './sentences': require(path.join(LUNA_DIR, 'sentences.js')), './config': require(path.join(LUNA_DIR, 'config.js')), './prompt': require(path.join(LUNA_DIR, 'prompt.js')), path: require('path'),
+    './answer-llm': require(path.join(LUNA_DIR, 'answer-llm.js')), './commands': require(path.join(LUNA_DIR, 'commands.js')), './voice-playback': require(path.join(LUNA_DIR, 'voice-playback.js')), './voice-session': require(path.join(LUNA_DIR, 'voice-session.js')), './voice-listen': require(path.join(LUNA_DIR, 'voice-listen.js')), './phrases': require(path.join(LUNA_DIR, 'phrases.js')), './announce': require(path.join(LUNA_DIR, 'announce.js')), './voice-answer': require(path.join(LUNA_DIR, 'voice-answer.js')), './whisper': require(path.join(LUNA_DIR, 'whisper.js')), './now-playing': require(path.join(LUNA_DIR, 'now-playing.js')), './wake-backup': require(path.join(LUNA_DIR, 'wake-backup.js')),
+  };
+
+  // ── fetch: LM Studio ──
+  Object.assign(mods, overrides);
+  S.model = 'model-a';
+  const fakeFetch = async (url, init = {}) => {
+    if (url.includes('whisper')) {
+      (S.sttPrompts ??= []).push(init.body.get('prompt'));
+      return { ok: true, json: async () => ({ text: (S.transcripts || []).shift() || '' }) };
+    }
+    if (url.includes('top-songs')) { (S.topSongsAsked ??= []).push(url); if (S.musicDown) throw new Error('connect ECONNREFUSED');
+      const n = Number(new URL(url).searchParams.get('count')); return { ok: true, json: async () => ({ songs: (S.topSongs ?? []).slice(0, n) }) }; }
+    if (url.includes('now-playing')) { S.nowPlayingAsked = (S.nowPlayingAsked || 0) + 1; if (S.musicDown) throw new Error('connect ECONNREFUSED'); return { ok: true, json: async () => S.nowPlaying ?? { playing: false } }; }
+    if (url.endsWith('/api/v1/models')) return { ok: true, json: async () => ({ models: [{ type: 'llm', loaded_instances: [{ id: S.model }] }] }) };
+    const body = JSON.parse(init.body); S.llmRequests.push({ at: Date.now(), model: body.model, messages: body.messages, prev: body.previous_response_id, reasoning: body.reasoning, input: body.input, system: body.system_prompt, tools: !!(body.integrations && body.integrations.length), integrations: body.integrations });
+    if (body.messages && S.deepseekStatus) return new Response(null, { status: S.deepseekStatus });
+    if (body.messages) return new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: S.deepseekText || 'Short answer.' }, finish_reason: null }] }) +
+      '\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+    init.signal.addEventListener('abort', () => { S.aborted = (S.aborted || 0) + 1; }, { once: true });
+    if (body.model !== S.model) return { ok: false, status: 404, text: async () => 'model not found' };
+    if (S.mcpDown && body.integrations) return { ok: false, status: 400, text: async () => JSON.stringify({ error: { message: "Unable to connect to remote MCP server 'tavily' at url 'https://mcp.tavily.com/mcp/'. Please ensure the provided url is correct and the server is reachable." } }) };
+    if (S.lunaDown && body.integrations?.some(i => i.id === 'mcp/luna')) return { ok: false, status: 400, text: async () => JSON.stringify({ error: { message: "Unable to connect to MCP server 'luna' at url 'http://127.0.0.1:8895/mcp'.", type: 'mcp_connection_error', param: 'integrations' } }) };
+    if (S.force400) return { ok: false, status: 400, text: async () => 'max_output_tokens must be positive' };
+    S.stored ??= new Set();
+    if (body.previous_response_id && !S.stored.has(body.previous_response_id))
+      return { ok: false, status: 400, text: async () => JSON.stringify({ error: { message: `Could not find stored response for previous_response_id '${body.previous_response_id}'.`, type: 'invalid_request', param: 'previous_response_id' } }) };
+    const rid = 'resp_' + (S.nextRid = (S.nextRid || 0) + 1); S.stored.add(rid);
+    const script = (S.llmScripts && S.llmScripts.length) ? S.llmScripts.shift() : S.llmScript; // array of [delayMs, eventOrNull]
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({ async start(c) {
+      try {
+        for (const [ms, ev] of script) {
+          await new Promise((r, j) => { const t = setTimeout(r, ms); init.signal.addEventListener('abort', () => { clearTimeout(t); j(init.signal.reason); }, { once: true }); });
+          if (ev) c.enqueue(enc.encode('data: ' + JSON.stringify(ev) + '\n\n'));
+        }
+        c.enqueue(enc.encode('data: ' + JSON.stringify({ type: 'chat.end', result: { output: [{ type: 'message', content: 'x' }], response_id: rid,
+          stats: { input_tokens: 1234, total_output_tokens: 56, reasoning_output_tokens: 40, tokens_per_second: 6.9, time_to_first_token_seconds: 12.34 } } }) + '\n\n')); c.close();
+      } catch (e) { c.error(e); }
+    }});
+    return { ok: true, status: 200, headers: { get: () => 'text/event-stream' }, body: stream };
+  };
+
+  const src = fs.readFileSync(path.join(LUNA_DIR, 'index.js'), 'utf8');
+  const ctx = {
+    require: m => { if (m in mods) return mods[m]; throw new Error('unmocked ' + m); },
+    process: { env: { LLM_PROVIDER: 'lmstudio', LM_STUDIO_URL: 'http://lm/api/v1/chat', MUSIC_STATUS_URL: 'http://music/now-playing', OWW_ENABLED: 'true', LLM_TOOLS: 'false', GREETINGS_FILE: '/nonexistent/greetings.json', WHISPER_SERVER_URLS: 'http://whisper/inference', TAVILY_API_KEY: 'test-key', ...env },
+      hrtime: process.hrtime,
+      once: (event, handler) => { (S.signals ??= {})[event] = handler; }, exit: c => { throw new Error('exit ' + c); } },
+    console: { log, warn: log, error: log }, fetch: transport || fakeFetch, setTimeout, clearTimeout, setInterval: () => ({ unref() {} }), clearInterval: () => {},
+    AbortController, AbortSignal, DOMException, TextDecoder, TextEncoder, URL, Promise, Date, Math, Map, Set, WeakSet, Buffer, FormData, Blob, __dirname: LUNA_DIR,
+  };
+  vm.createContext(ctx);
+  vm.runInContext(src + `
+;globalThis.__t = { client, session, conversation, musicEngine, audioCoordinator, get memoryEngine() { return memoryEngine; }, autoJoin, get autoJoinPaused() { return autoJoinPaused; }, wakeBackup, answerMissedWake: answerer.answerMissedWake, handleQuery: answerer.answer, ...require('./commands'), condenseSearchResults: require('./answer-llm').condenseSearchResults, speakableName, nextGeneration: playback.nextGeneration, interruptOwnPlayback: playback.interrupt, spokenResponses: playback.responses,
+  get activeConnection() { return session.connection; }, get activeVoiceChannel() { return session.channel; }, get ready() { return ready; },
+  get model() { return llm.model; }, THINKING: answerer.settings.thinking, LLM: { reasoning: llm.reasoning, thinkLimit: answerer.settings.thinkLimit } };`, ctx);
+  const T = ctx.__t;
+
+  // helpers
+  const members = new Map(); // channelId -> Map(userId -> member)
+  const channel = (id) => ({ id, name: id, type: 2, permissionsFor: () => ({ has: permission => !(S.deniedPermissions || []).includes(permission) }), guild: { id: 'g', voiceAdapterCreator: {} }, isVoiceBased: () => true, isTextBased: () => true, send: async m => {
+    if (typeof m === 'object') { if (S.noticeDown) throw new Error('No send permission'); await new Promise(r => setTimeout(r, S.sendMs ?? 0)); S.sends.push(m); }
+    else S.sends.push(`#${id}: ${m}`);
+    return { delete: async () => {}, edit: async () => {} }; }, members: { get: uid => (members.get(id) || new Map()).get(uid), filter: f => { const arr = [...(members.get(id) || new Map()).values()].filter(f); return { size: arr.length }; }, forEach: f => (members.get(id) || new Map()).forEach(f), some: f => [...(members.get(id) || new Map()).values()].some(f), values: () => (members.get(id) || new Map()).values() } });
+  // Like discord.js, member.voice is live: it reports where the user is now, not
+  // where they were when the object was created.
+  const currentChannel = uid => { for (const [cid, m] of members) if (m.has(uid)) return cid; return null; };
+  const member = (uid, chan) => ({ id: uid, user: { bot: uid === 'luna' || (S.bots || []).includes(uid), tag: uid, username: uid }, displayName: (S.names && S.names[uid]) || uid,
+    voice: { get channelId() { return currentChannel(uid); }, get channel() { const c = currentChannel(uid); return c ? channel(c) : null; } } });
+  const text = { send: async (m) => { S.sends.push(m); await new Promise(r => setTimeout(r, S.sendMs ?? 0)); return { delete: async () => { S.sends.push('deleted:' + m); }, edit: async t => { S.sends.push('edit:' + t); } }; } };
+  const H = {
+    S, T, Status, wait: ms => new Promise(r => setTimeout(r, ms)),
+    // Waits until fn() is true (or ms pass). Tests that feed audio in real
+    // time use it instead of fixed waits: on a busy machine timers run late.
+    until: async (fn, ms = 4000) => { const end = Date.now() + ms; while (!fn() && Date.now() < end) await new Promise(r => setTimeout(r, 20)); },
+    put(uid, chan) { for (const m of members.values()) m.delete(uid); if (chan) { if (!members.has(chan)) members.set(chan, new Map()); members.set(chan, members.get(chan)).get(chan).set(uid, member(uid, chan)); } },
+    channel,
+    async luna(uid) { const m = members.get([...members.keys()].find(k => members.get(k).has(uid)))?.get(uid) || member(uid, null);
+      T.client.emit('messageCreate', { content: '!luna', author: { id: uid, bot: false }, member: m, guild: { id: 'g', voiceAdapterCreator: {} }, channel: text, reply: async r => { S.replies.push(r); } }); await H.wait(5); },
+    move(uid, from, to) { H.put(uid, to); const mk = c => ({ id: uid, guild: { id: 'g' }, channelId: c, channel: c ? channel(c) : null, member: member(uid, c) });
+      T.client.emit('voiceStateUpdate', mk(from), mk(to)); },
+    async start() { T.client.emit('ready'); await H.wait(20); },
+    text,
+  };
+  return H;
+};

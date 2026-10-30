@@ -1,0 +1,40 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
+const { createConversationDiagnostics } = require('../conversation-diagnostics');
+test('diagnostics disabled stores no transcript log or observers', () => {
+  const logs = [], d = createConversationDiagnostics({ log: e => logs.push(e) });
+  d.transcript({ transcript: 'private', sequence: 1 }); d.state({ event: 'accepted', sequence: 1 });
+  d.firstContent(); d.bodyChunk(new Uint8Array(50)); d.responseObserver()({ event: 'ttsRequest' });
+  assert.equal(logs.length, 0);
+});
+test('passive observations correlate transcript/content/audio/player and label cancellation', () => {
+  let at = 0; const logs = [], d = createConversationDiagnostics({ enabled: true, log: e => logs.push(e), now: () => ++at });
+  d.transcript({ sequence: 7, speaker: 'a', transcript: 'hello' });
+  d.state({ event: 'accepted', sequence: 7, speaker: 'a', generation: 3 });
+  const observe = d.responseObserver(); observe({ event: 'ttsRequest', text: 'Answer.' });
+  d.firstContent(); d.firstContent(); d.bodyChunk(new Uint8Array(44));
+  assert.equal(logs.filter(e => e.event === 'ttsFirstPcm').length, 0);
+  d.bodyChunk(new Uint8Array(2)); d.bodyChunk(new Uint8Array(5));
+  const player = d.observePlayer(new EventEmitter(), { Playing: 'playing', Idle: 'idle' });
+  player.emit('playing'); d.state({ event: 'state', state: 'STOPPING' }); player.emit('idle');
+  observe({ event: 'playbackFinished', ok: false });
+  assert.equal(logs.filter(e => e.event === 'llmFirstContent').length, 1);
+  assert.equal(logs.filter(e => e.event === 'ttsFirstPcm').length, 1);
+  assert.ok(logs.some(e => e.event === 'playerPlaying' && e.sequence === 7));
+  assert.equal(logs.at(-1).stale, true);
+  assert.equal(player.listenerCount('playing'), 0);
+});
+test('metadata-only diagnostics retain timing and memory counts without transcript or answer content', () => {
+  const logs = [], d = createConversationDiagnostics({ enabled: true, metadataOnly: true, log: e => logs.push(e), now: () => 50 });
+  d.transcript({ sequence: 2, transcript: 'private speech', speaker: 'private name', sttCompletedAt: 40 });
+  d.state({ event: 'accepted', sequence: 2, generation: 1 });
+  d.responseObserver()({ event: 'ttsRequest', text: 'private answer', nested: { text: 'private nested' } });
+  d.firstContent(); d.bodyChunk(new Uint8Array(50));
+  d.emit('resources', { requestCount: 1, memory: { rss: 1000, secret: 'private memory' }, dave: [{ text: 'private verdict' }] });
+  assert.doesNotMatch(JSON.stringify(logs), /private|transcript":|speaker|nested|secret|verdict/);
+  assert.equal(logs[0].sttCompletedAt, 40);
+  assert.ok(logs.some(e => e.event === 'llmFirstContent' && e.sequence === 2));
+  assert.ok(logs.some(e => e.event === 'ttsFirstPcm' && e.sequence === 2));
+  assert.deepEqual(logs.at(-1).memory, { rss: 1000 });
+});

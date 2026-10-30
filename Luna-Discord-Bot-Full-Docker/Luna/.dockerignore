@@ -1,0 +1,43 @@
+# Secrets are read by Compose at runtime (env_file) and must never be baked
+# into an image layer by `COPY . .`.
+.env
+.env.*
+!example.env
+
+# The image runs `npm ci` itself. A host node_modules (e.g. built on macOS)
+# would overwrite the Linux native binaries for onnxruntime-node and
+# @discordjs/opus and crash on load.
+node_modules
+npm-debug.log*
+
+.git
+Dockerfile
+.dockerignore
+
+# Tests run against the source (npm test), never inside the image.
+test
+
+# The LLM benchmark runs from the source checkout, never inside the image.
+bench
+
+# Server-specific files (custom greetings): mounted at runtime instead.
+local
+
+# The wake-word log: written at runtime to a mounted folder.
+logs
+
+# Rendered phrases: written at runtime to a mounted folder.
+cache
+
+# Persistent memory and generated/user audio are never image inputs.
+data
+voice-eval
+voice-references
+*.sqlite*
+*.db
+*.db-*
+*.log
+*.jsonl
+*.wav
+*.mp3
+*.flac

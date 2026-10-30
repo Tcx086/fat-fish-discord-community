@@ -1,0 +1,22 @@
+# Prepared only. Obtain a compatible multilingual GGML model separately; no build/pull/download.
+services:
+  whisper:
+    image: deepseek-phase15-whisper
+    pull_policy: never
+    restart: "no"
+    read_only: true
+    tmpfs: ["/tmp:size=32m"]
+    cpus: 4
+    mem_limit: 2g
+    ports: ["127.0.0.1:18082:8080"]
+    volumes:
+      - type: bind
+        source: ${PASSIVE_WHISPER_MODEL_FILE:?Set an absolute path to a multilingual GGML model}
+        target: /models/multilingual.bin
+        read_only: true
+        bind:
+          create_host_path: false
+    # Supply the character's spelling to ASR; invocation matching remains strict.
+    command: ["/whisper/build/bin/whisper-server", "-m", "/models/multilingual.bin", "--host", "0.0.0.0", "--port", "8080", "-t", "4", "-bs", "1", "-bo", "1", "-nt", "-ng", "-l", "auto", "--prompt", "大肥鱼。"]
+    logging:
+      driver: none
