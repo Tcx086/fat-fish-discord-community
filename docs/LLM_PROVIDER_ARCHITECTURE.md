@@ -190,16 +190,22 @@ needs input/output/concurrency limits; locality does not waive these controls.
 
 ## Validation and remaining work
 
-This task runs only JavaScript syntax checks, static import consistency, a small
-deterministic provider contract file with synthetic in-memory responses, and Git
-diff checks. Synthetic checks cover compatibility with the original request and
+Validation is limited to JavaScript syntax checks, static import consistency,
+the targeted offline v0.2/v0.3 suites, a deterministic provider contract file with
+synthetic in-memory responses, and Git diff checks. Synthetic checks cover compatibility with the original request and
 history lifecycle, capability refusal, opt-in gates, cancellation, accounting
 preservation and configuration policy. They are not live provider validation.
 
-Local result: all 10 provider contract checks passed; all 8 changed/new JavaScript
-files passed `node --check`; provider/config/runtime imports and exports resolved;
-`git diff --check` passed. The existing dynamic-voice fixture was updated to inject
-the new factory, but that broader voice test file was not executed.
+Local result: `npm run test:v02` passed 45/45, `npm run test:v03` passed 30/30,
+and `node --test test/llm-provider-contract.test.js` passed 10/10. The text-status
+fixture explicitly selects DeepSeek rather than inheriting the legacy LM Studio
+harness default, and verifies that status makes no model request. The existing
+dynamic-voice fixture injects the new factory and is covered by the v0.3 run.
+The offline runs reuse an existing dependency directory through temporary
+`NODE_PATH`; its lockfile SHA-256 matches this checkout. No dependencies were
+installed or updated. Initial static checks passed `node --check` for all 8
+then-changed/new JavaScript files; provider/config/runtime imports and exports
+resolved, and `git diff --check` passed.
 
 Exact changed files (paths relative to repository root):
 
@@ -213,11 +219,12 @@ Exact changed files (paths relative to repository root):
 | `Luna-Discord-Bot-Full-Docker/Luna/providers.env.example` | Disabled future configuration examples. |
 | `Luna-Discord-Bot-Full-Docker/Luna/test/llm-provider-contract.test.js` | Deterministic contract checks. |
 | `Luna-Discord-Bot-Full-Docker/Luna/test/harness.js` | Register factory in existing mock module map. |
+| `Luna-Discord-Bot-Full-Docker/Luna/test/v02-adapters.test.js` | Select DeepSeek explicitly in text-status fixture and assert zero model requests. |
 | `Luna-Discord-Bot-Full-Docker/Luna/test/v03-dynamic-voice.test.js` | Preserve existing delayed-transport fixture injection. |
 | `docs/LLM_PROVIDER_ARCHITECTURE.md` | Architecture, boundaries, evidence, risks and future work. |
 | `README.md` | Provider status and architecture link. |
 
-Integration risks: voice and Discord behavior are not revalidated here; current
+Integration risks: live voice and Discord behavior are not revalidated here; current
 provider-specific voice gates/errors remain intentional compatibility constraints.
 An invalid provider ID now fails startup rather than recovering to the paid default.
 Text runtime LM Studio selection now refuses instead of ignoring the selection and
@@ -244,5 +251,6 @@ Future separately authorized steps:
    DeepSeek regression/live validation also remains outside this task's evidence.
 
 No live API calls, inference, GPU benchmarks, Discord sessions, full repository
-suite, launcher edits, deployment, running-service changes, push, PR or Actions
-changes are part of this preparation.
+suite, launcher edits, deployment, running-service changes or Actions changes are
+part of this preparation. Branch publication and PR creation were separately
+authorized after the initial local implementation.
