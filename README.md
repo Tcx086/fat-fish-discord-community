@@ -23,9 +23,9 @@ A self-hosted, experimental Discord companion built around local speech recognit
 
 ## Meet Fat Fish
 
-Imagine joining a voice channel and talking normally with your friends. Fat Fish can maintain a short, temporary transcript of permitted speech, but it stays silent until someone says **“大肥鱼”** (*Da Fei Yu*).
+Imagine joining a voice channel and talking normally with your friends. Fat Fish can maintain a short, temporary transcript of permitted speech, but it stays silent until someone directly addresses it with **“大肥鱼”** (*Da Fei Yu*) or a configured wake phrase.
 
-When called, it can use the recent conversation to answer once, speak through a configured voice service, and return to listening. This is a name-triggered interaction, **not** a model that reliably understands when humans want it to join in: mentions and quotations containing the name can also trigger it.
+When called, it can use the recent conversation to answer once, speak through a configured voice service, and return to listening. Administrators and configured operators can use `/wake` to choose a Chinese/English phrase and direct-address or anywhere matching. Quoted names are excluded; matching uses bounded text rules and cannot reliably infer intent. See [configurable wake phrases](docs/CONFIGURABLE_WAKE.md) and the [voice asset rights review](docs/VOICE_ASSET_RELEASE_REVIEW.md).
 
 ```text
 You:       We could play something together tonight.
