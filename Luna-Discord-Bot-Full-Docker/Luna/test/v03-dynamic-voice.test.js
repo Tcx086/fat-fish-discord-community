@@ -198,7 +198,7 @@ for (const stage of ['stt', 'llm']) test(`move aborts in-flight ${stage}; delibe
   let signal, release;
   const held = new Promise(resolve => { release = resolve; });
   const overrides = stage === 'stt' ? { './whisper': { createWhisper: () => ({ transcribe: (_pcm, options) => { signal = options.signal; return held; } }) } } : {
-    './deepseek': { ...require('../deepseek'), createDeepSeek: options => require('../deepseek').createDeepSeek({ ...options,
+    './llm-providers': { ...require('../llm-providers'), createProvider: options => require('../llm-providers').createProvider({ ...options,
       fetch: (_url, init) => { signal = init.signal; return held; } }) },
   };
   const h = fixture(t, { overrides }); await join(h); await say(h, '大肥鱼，你怎么看？');
