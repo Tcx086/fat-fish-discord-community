@@ -1,89 +1,156 @@
-# Fat Fish Discord — v0.4.0-alpha
+<div align="center">
 
-An independent Discord voice/text assistant derived from
-[smakus/Luna](https://github.com/smakus/luna-discord-ai-voice-chatbot).
-It combines local speech recognition, optional DeepSeek text inference, optional
-local speech synthesis, scoped memory and an authorized local music catalog.
-It is unofficial and is not endorsed by Discord, DeepSeek or upstream authors.
+# 🐟 Fat Fish Discord
 
-**Source-only alpha candidate, prepared locally. Public release is not authorized.**
-This is experimental software, with no turnkey model bundle or production-readiness
-claim. See [the publication gate](docs/PUBLICATION_GATE.md) for exact validation
-and owner actions.
+### A voice-first AI companion for Discord
 
-## Features and limits
+**Listens quietly. Speaks when called. Remembers with permission.**
 
-| Feature | Scope |
-| --- | --- |
-| Voice lifecycle | Join/move/leave, pause/resume/stop, cancellation and session isolation; one guild/voice session per process. Real Opus/DAVE loading is tested offline. |
-| Mandarin invocation | Local Whisper transcribes eligible speech before name matching. A mention or quotation containing 大肥鱼 can trigger a reply. |
-| DeepSeek | Bounded streaming text responses and cancellation; disabled in the inert example. Enabled requests transmit text/context externally and may incur charges. |
-| Memory/text | Optional SQLite consent, review, recall, export/deletion; local CLI and allowlisted ephemeral `/fish` text. Persistence defaults off. |
-| Search | Optional bounded Search/Fetch and synthesis. Sources and model claims can be wrong; no freshness guarantee. |
-| Music | Local file catalog, queue and speech/music coordination. No songs, downloader or streaming service integration supplied. |
-| TTS | Feiyu HTTP adapter and synthetic service tests. GPU runtime, models and reference voices must be obtained separately with appropriate permission. |
-| Legacy/experimental | ONNX wake inference, alternate TTS, WeChat/WeCom and Windows launch helpers have separate limitations. They are not a supported turnkey stack. |
+A self-hosted, experimental Discord companion built around local speech recognition, DeepSeek, customizable text-to-speech, scoped memory, and a local music player.
 
-## Install and verify independently
+[![Stage: Alpha](https://img.shields.io/badge/stage-v0.4.0--alpha-F0A04B?style=flat-square)](docs/RELEASE_NOTES_v0.4.0-alpha.md)
+[![Source only](https://img.shields.io/badge/distribution-source--only-64748B?style=flat-square)](docs/INSTALLATION.md)
+[![License notices](https://img.shields.io/badge/licenses-MIT%20%26%20Apache--2.0-4477AA?style=flat-square)](THIRD_PARTY_NOTICES.md)
 
-Obtain an approved source archive/checkout. You do not need the private repository,
-its environments, credentials or models to install Node dependencies and run offline
-checks. Requirements: Node >=22.12.0 (use a currently patched supported release),
-npm, and FFmpeg/FFprobe on PATH. Native Opus may require Python and a C++ toolchain.
+[Explore features](#what-it-can-do) · [How it works](#how-it-works) · [Get started](#getting-started) · [Privacy](#privacy-first-by-design)
 
-```sh
-cd Luna-Discord-Bot-Full-Docker/Luna
+</div>
+
+---
+
+> [!IMPORTANT]
+> **Public source-only alpha — not a hosted bot or a one-click install.** This repository does not include model weights, voice references, recordings, artwork, or music. You provide and operate your own Discord bot, compatible speech services, and properly licensed assets. The published snapshot has not been certified as a production deployment.
+
+## Meet Fat Fish
+
+Imagine joining a voice channel and talking normally with your friends. Fat Fish can maintain a short, temporary transcript of permitted speech, but it stays silent until someone says **“大肥鱼”** (*Da Fei Yu*).
+
+When called, it can use the recent conversation to answer once, speak through a configured voice service, and return to listening. This is a name-triggered interaction, **not** a model that reliably understands when humans want it to join in: mentions and quotations containing the name can also trigger it.
+
+```text
+You:       We could play something together tonight.
+Friend:    Maybe something co-op?
+You:       大肥鱼，你觉得呢？
+Fat Fish:  If you're playing together, I'd start with a co-op game...
+```
+
+*Illustrative dialogue, not a recording or benchmark.*
+
+## What it can do
+
+| Capability | What is included | Availability |
+| :-- | :-- | :-- |
+| **Voice companion** | Discord voice reception, local STT, name-triggered responses, Feiyu-compatible TTS and interruption controls | Integrated; requires external models and configuration |
+| **Dynamic voice channels** | `/join`, `/move`, `/leave`, `/stop`; one active voice channel per process | Implemented |
+| **DeepSeek chat** | Streaming text responses, cancellation and bounded request controls | Opt-in; external API charges may apply |
+| **Memory** | Temporary context plus optional scoped SQLite history, approved memories, review and deletion | Persistence off by default |
+| **Text chat** | Local CLI and restricted Discord `/fish` interactions | Opt-in |
+| **Current information** | Bounded optional Search/Fetch integration with source handling | Opt-in; verify provider access and results |
+| **Music** | Local authorized file catalog, queue, playback commands and speech/music coordination | Implemented; live music playback not verified for this snapshot |
+
+Fat Fish is **not** an autonomous group participant, a general-purpose agent, or a streaming-service music downloader.
+
+## How it works
+
+```mermaid
+flowchart TD
+    A[Discord voice channel] --> B[Voice transport<br/>DAVE / Opus]
+    B --> C[Configured Whisper STT]
+    C --> D[Temporary rolling context]
+    C --> E{"Name detected?"}
+    E -- No --> F[Remain silent]
+    E -- Yes --> G[Context builder]
+    D --> G
+    M[(Optional scoped SQLite memory)] --> G
+    G --> H[DeepSeek text API]
+    H --> I[Local TTS service]
+    I --> J[Audio coordinator]
+    K[Authorized local music library] --> L[Music player / FFmpeg]
+    L --> J
+    J --> N[Discord audio output]
+```
+
+The audio coordinator keeps speech and music from competing for the same voice output. It pauses music for a spoken response and resumes playback when appropriate. No second Discord bot is required.
+
+For a module-by-module map, see [Architecture](docs/ARCHITECTURE.md).
+
+## Getting started
+
+### 1. Verify the source locally — no keys or models required
+
+You need a patched supported **Node.js** release (declared minimum `22.12.0`), npm, and **FFmpeg/FFprobe** on your PATH. Native Opus may require Python and C++ build tools.
+
+```bash
+git clone https://github.com/Tcx086/fat-fish-discord-community.git
+cd fat-fish-discord-community/Luna-Discord-Bot-Full-Docker/Luna
+
 npm ci --ignore-scripts --no-audit --no-fund
 npm rebuild @discordjs/opus --no-audit --no-fund
-node --test test/publication-dependencies.test.js test/phase0-native.test.js
+
 npm run test:v02
 npm run test:v03
 npm run test:music
 ```
 
-The install above uses public package sources and deliberately skips the ONNX
-installer. Native packages/binaries are software dependencies, not model weights.
-No credentials or model assets are required for these checks. Use
-[INSTALLATION.md](docs/INSTALLATION.md) for platform prerequisites, synthetic Python
-checks, external assets and deliberate configuration. Do not use `npm start` or
-launchers as installation tests: they can connect to Discord and start services.
+These commands install/test the Node-side source. They **do not** start the Discord bot, download voice models, or certify a complete GPU environment. The full suite has **491 passing tests and seven known inherited failures**; see [release notes](docs/RELEASE_NOTES_v0.4.0-alpha.md) and [test results](docs/PUBLICATION_GATE.md).
 
-The [dependency review](docs/DEPENDENCY_SECURITY_REVIEW.md) covers each of the
-11 previously affected npm packages and 40 advisories. The fresh fixed-lock audit
-has zero findings; this does not certify native binaries, Python, OS or Node itself.
-The full Node suite still has seven inherited failures, recorded separately in
-the gate. Models, GPU inference and live Discord/music were not tested here.
+### 2. Prepare your own runtime
 
-## Privacy and configuration
+1. Create your own Discord application and bot token.
+2. Set up a compatible local multilingual Whisper endpoint and a voice service, with assets you are authorized to use.
+3. Review `Luna-Discord-Bot-Full-Docker/Luna/fat-fish.env.example` and configure credentials privately. Keep features disabled until intentionally enabled.
+4. Use explicit participant/operator allowlists and review the data-processing notices before enabling transcription.
+5. Follow the [Installation guide](docs/INSTALLATION.md), [Deployment boundaries](docs/DEPLOYMENT.md), and [Privacy policy](PRIVACY.md) **before** starting the bot.
 
-Start with `fat-fish.env.example`; enable flags and persistence remain off.
-Keep `LLM_PROVIDER=deepseek`; inference remains off until explicitly enabled.
-Supply your own credentials only in the environment or ignored `.env`, then review
-the effective configuration. Use explicit participant/operator allowlists and
-`CONVERSATION_ALL_PARTICIPANTS=false`. Keep `OWW_ENABLED=false`, `LLM_TOOLS=false`
-and `WAKE_LOG_FILE=` until separately reviewed.
+> [!CAUTION]
+> `npm start` and the Windows launcher are **operational commands**: they can connect to Discord or start local services. They are not installation smoke tests. The Windows launcher currently enables broad participant capture; use the manual allowlist profile where explicit participant selection is required.
 
-Give participants notice and obtain appropriate agreement before transcription or
-external text processing. Memory consent is separate from temporary transcription.
-`/opt-out` is runtime-only and does not survive restart. SQLite encryption,
-retention, backups and provider-side deletion are operator responsibilities.
-The Windows launcher uses all-participant mode; use the manual profile when an
-explicit transcription allowlist is required. See [PRIVACY.md](PRIVACY.md).
+## Commands at a glance
 
-## Assets, attribution and contributions
+| Command | Purpose |
+| :-- | :-- |
+| `/join` · `/move` · `/leave` | Enter, switch, or leave an authorized voice channel |
+| `/stop` · `/pause` · `/resume` | Emergency disconnect or control transcription |
+| `/opt-out` · `/opt-in` | Control your own participation in transcription |
+| `/fish` | Optional, allowlisted private text interaction |
+| `/memory` | Optional scoped memory consent, review and deletion |
+| `/music play` · `/music skip` · `/music pause` | Control tracks from an operator-authorized local library |
 
-No model weights, reference voices, recordings, music, artwork or character likeness
-are included. The generic text identity grants no third-party asset rights.
-Feiyu fine-tunes/references and wake models have separate terms. Legacy acquisition
-entry points require explicit asset opt-in; that opt-in does not grant permission.
+Available commands depend on enabled modules, configured permissions, and registration. The bot does not automatically join channels or play music in the recommended configuration.
 
-Luna's **Copyright (c) 2026 smakus** and [MIT license](LICENSE) are preserved.
-The adapted openWakeWord implementation also retains **Copyright 2022 David Scripka**,
-Apache-2.0 and a modification notice. Read [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+## Privacy first, by design
 
-Contributions should use synthetic fixtures, preserve attribution, identify borrowed
-source/licenses and report focused test results. See [CONTRIBUTING.md](CONTRIBUTING.md),
-[SECURITY.md](SECURITY.md), [architecture](docs/ARCHITECTURE.md) and
-[draft release notes](docs/RELEASE_NOTES_v0.4.0-alpha.md).
-GitHub Private Vulnerability Reporting is preferred but **OWNER_ACTION_REQUIRED**;
-it is not claimed to be enabled, and no security email is supplied.
+Passive listening **does transcribe permitted speech before the name is detected**. The default working buffer is bounded (up to three minutes / 40 utterances); persistent history is a **separate opt-in feature**. When DeepSeek is enabled and the bot is invoked, bounded text and eligible context are sent to an external service. Raw microphone audio is not sent to DeepSeek by the documented integration.
+
+Before using this in a real server:
+
+- Inform participants and obtain appropriate agreement for transcription and external processing.
+- Review the distinction between temporary context and persistent, scoped memory.
+- Protect local storage, keys, logs, and model assets; plan retention and deletion.
+- Note that `/opt-out` is **not durable across a full bot restart** in this alpha.
+
+Read [PRIVACY.md](PRIVACY.md) for the complete data flow, controls, retention limits and operator responsibilities.
+
+## Project status
+
+This is an **experimental source release**. Native audio/codec and focused application tests have passed, but the public snapshot has not been independently validated as a clean-OS, complete GPU/Whisper/Feiyu install. Real Discord music playback, multi-user stability and long-duration listening are not certified. Known inherited tests remain failing. No production SLA or model-asset license is provided.
+
+See [Release notes](docs/RELEASE_NOTES_v0.4.0-alpha.md), [Installation](docs/INSTALLATION.md), and [Security](SECURITY.md) for detailed limits.
+
+## Credits & licensing
+
+Fat Fish Discord is an **independent, unofficial** project derived from [smakus/Luna Discord AI Voice Chatbot](https://github.com/smakus/luna-discord-ai-voice-chatbot). The original **MIT copyright and license** remain in [LICENSE](LICENSE).
+
+The JavaScript openWakeWord-based implementation additionally carries its applicable **Apache-2.0 notices**, copyright attribution and modification record. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [licenses](licenses/Apache-2.0.txt).
+
+**Models, weights, character images, reference voices, music and other external assets have separate rights and are not included.** A project's code license does not grant rights to these assets. This project is not affiliated with or endorsed by DeepSeek, Discord or the upstream maintainers.
+
+Contributions are welcome: start with [CONTRIBUTING.md](CONTRIBUTING.md). For vulnerabilities, use the repository's **Security → Report a vulnerability** private reporting flow rather than a public issue.
+
+<div align="center">
+
+---
+
+Built to make a Discord bot feel less like a command line—and more like someone you can call into the conversation.
+
+</div>
