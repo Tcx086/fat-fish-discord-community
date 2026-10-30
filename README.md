@@ -143,6 +143,12 @@ Fat Fish Discord is an **independent, unofficial** project derived from [smakus/
 
 The JavaScript openWakeWord-based implementation additionally carries its applicable **Apache-2.0 notices**, copyright attribution and modification record. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [licenses](licenses/Apache-2.0.txt).
 
+### Feiyu voice credits
+
+The optional **Feiyu `cute` speaking voice** used during local development is based on [FeiyuVoice-CosyVoice3](https://huggingface.co/Esmerubphire/FeiyuVoice-CosyVoice3), published by [Esmerubphire](https://github.com/Esmerubphire). The publisher's [voice project](https://github.com/Esmerubphire/astrbot_plugin_feiyu_voice) credits Bilibili creator [星落落_oi](https://space.bilibili.com/30584746/) as the source of the original audio material and states that the creator authorized its use for **that project's model training**. Thank you to the original audio creator and the voice-model publisher for their work.
+
+**Voice rights are separate from code rights.** That training authorization is not a blanket license for us or others to re-host weights, redistribute reference audio, or use the voice commercially. This repository distributes **adapter code only**, not the Feiyu checkpoints or audio assets. See the upstream [COPYRIGHT](https://github.com/Esmerubphire/astrbot_plugin_feiyu_voice/blob/main/COPYRIGHT.md), [NOTICE](https://github.com/Esmerubphire/astrbot_plugin_feiyu_voice/blob/main/NOTICE.md) and model page for provenance and usage terms.
+
 **Models, weights, character images, reference voices, music and other external assets have separate rights and are not included.** A project's code license does not grant rights to these assets. This project is not affiliated with or endorsed by DeepSeek, Discord or the upstream maintainers.
 
 Contributions are welcome: start with [CONTRIBUTING.md](CONTRIBUTING.md). For vulnerabilities, use the repository's **Security → Report a vulnerability** private reporting flow rather than a public issue.
