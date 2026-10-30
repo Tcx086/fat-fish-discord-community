@@ -107,3 +107,29 @@ can connect Discord or start local services. They were not run here. The Windows
 launcher forces all-participant mode: use the manual profile for explicit allowlists.
 Keep services on loopback. Read [PRIVACY](../PRIVACY.md), [SECURITY](../SECURITY.md)
 and [deployment boundaries](DEPLOYMENT.md) before any separately authorized launch.
+
+## Windows saved-credential recovery
+
+The launcher checks required saved credentials before starting local services.
+Missing or unreadable credentials reopen Configure; saving valid credentials lets
+startup continue, while cancelling with invalid credentials exits without starting
+services. Discord Token is required; DeepSeek Key is required only when its paid
+reply option is enabled. Tokens remain encrypted for the current Windows account.
+
+Repeated saves update only the configuration directory's access permissions,
+preserving access for the current user and SYSTEM without changing ownership or
+requesting audit privileges. This fixes `80070005` on an already-private directory.
+After updating launcher scripts, close old configuration/startup windows and reopen
+`Configure-FatFish.cmd`; an open window continues to execute its old script.
+
+Offline Windows regression checks, from the repository root:
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File tools/windows/test-config-form.ps1
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File tools/windows/test-start-recovery.ps1
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File tools/windows/FatFish.ps1 -Action SelfTest
+```
+
+These use synthetic credentials and private temporary directories. The startup
+recovery check mocks local services and Node execution; it cannot connect Discord
+or load a model. No real credential file is modified by these checks.
