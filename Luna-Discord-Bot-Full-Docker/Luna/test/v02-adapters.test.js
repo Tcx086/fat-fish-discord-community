@@ -102,12 +102,13 @@ test('common runtime sends bounded context with stable identity through existing
 });
 
 test('production index routes opt-in text privately without voice', async () => {
-  const h = boot({ FAT_FISH_TEXT_ENABLED: 'true', FAT_FISH_TEXT_GUILD_ID: 'g', FAT_FISH_TEXT_CHANNEL_ID: 'c', FAT_FISH_TEXT_USERS: 'alice' });
+  const h = boot({ LLM_PROVIDER: 'deepseek', FAT_FISH_TEXT_ENABLED: 'true', FAT_FISH_TEXT_GUILD_ID: 'g', FAT_FISH_TEXT_CHANNEL_ID: 'c', FAT_FISH_TEXT_USERS: 'alice' });
   const delivered = [];
   const handlers = h.T.client.listeners('interactionCreate');
   await handlers[0]({ isChatInputCommand: () => true, commandName: 'fish', id: 'test-1', guildId: 'g', channelId: 'c', user: { id: 'alice' },
     options: { getString: () => '/status' }, deferReply: async p => delivered.push(p), editReply: async p => delivered.push(p) });
   assert.equal(delivered[0].flags, 64); assert.match(delivered[1].content, /disabled/);
+  assert.equal(h.S.llmRequests.length, 0);
   h.S.signals.SIGTERM?.();
 });
 

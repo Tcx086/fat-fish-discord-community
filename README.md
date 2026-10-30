@@ -131,6 +131,11 @@ Before using this in a real server:
 
 Read [PRIVACY.md](PRIVACY.md) for the complete data flow, controls, retention limits and operator responsibilities.
 
+`LLM_PROVIDER` defaults to `deepseek`; `lmstudio` retains legacy Luna behavior.
+The `openai-compatible` and `ollama` identities are unimplemented experimental
+scaffolds and fail without fallback. See [LLM provider architecture](docs/LLM_PROVIDER_ARCHITECTURE.md)
+for the interface contract, disabled future configuration examples and validation limits.
+
 ## Project status
 
 This is an **experimental source release**. Native audio/codec and focused application tests have passed, but the public snapshot has not been independently validated as a clean-OS, complete GPU/Whisper/Feiyu install. Real Discord music playback, multi-user stability and long-duration listening are not certified. Known inherited tests remain failing. No production SLA or model-asset license is provided.

@@ -29,7 +29,7 @@ const { createWhisper } = require('./whisper');
 const { createWakeBackup } = require('./wake-backup');
 const { createWakeLog } = require('./wake-log');
 const { createLlm, TOOLS_PLUGIN_ID } = require('./answer-llm');
-const { createDeepSeek } = require('./deepseek');
+const { createProvider } = require('./llm-providers');
 const { loadDeepSeekConfig } = require('./deepseek-config');
 const { createNowPlaying } = require('./now-playing');
 const { createConversation } = require('./voice-conversation');
@@ -110,8 +110,8 @@ const nowPlaying = createNowPlaying({ config, fetch, console, music: musicEngine
 let conversationRequests = 0;
 const deepSeekConfig = config.LLM_PROVIDER === 'deepseek' ? loadDeepSeekConfig(process.env) : null;
 const passiveSystemPrompt = () => conversationInstructions(memoryEngine.character, `${deepSeekConfig.systemPrompt}\n${PASSIVE_INSTRUCTIONS}`);
-const llm = config.LLM_PROVIDER === 'deepseek'
-  ? createDeepSeek({ config: passiveMode ? { ...deepSeekConfig, retries: 0, concurrency: 1, historyTurns: 0, historyBytes: 0,
+const llm = config.LLM_PROVIDER !== 'lmstudio'
+  ? createProvider({ id: config.LLM_PROVIDER, config: passiveMode ? { ...deepSeekConfig, retries: 0, concurrency: 1, historyTurns: 0, historyBytes: 0,
     systemPrompt: passiveSystemPrompt(), getSystemPrompt: passiveSystemPrompt } : deepSeekConfig,
     console, onFirstContent: diagnostics.firstContent, fetch: async (...args) => {
     if (conversationConfig.enabled) {

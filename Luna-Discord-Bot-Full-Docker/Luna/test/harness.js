@@ -89,6 +89,7 @@ module.exports = function boot(env = {}, overrides = {}, transport = null) {
     './memory/engine': require(path.join(LUNA_DIR, 'memory/engine.js')),
     './memory/commands': require(path.join(LUNA_DIR, 'memory/commands.js')),
     './deepseek': require(path.join(LUNA_DIR, 'deepseek.js')),
+    './llm-providers': require(path.join(LUNA_DIR, 'llm-providers.js')),
     './deepseek-config': require(path.join(LUNA_DIR, 'deepseek-config.js')),
     './voice-conversation': require(path.join(LUNA_DIR, 'voice-conversation.js')),
     './passive-listener': require(path.join(LUNA_DIR, 'passive-listener.js')),

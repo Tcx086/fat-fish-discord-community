@@ -20,10 +20,12 @@
 //   enum     one of `choices` (case-insensitive)
 //   list     comma-separated                 phrases '|'-separated, trimmed
 
+const { selectProvider, PROVIDER_IDS } = require('./llm-provider-config');
+
 const SETTINGS = [
   // Discord and services
   { name: 'DISCORD_TOKEN', type: 'secret' },
-  { name: 'LLM_PROVIDER', type: 'enum', default: 'deepseek', choices: ['deepseek', 'lmstudio'] },
+  { name: 'LLM_PROVIDER', type: 'enum', default: 'deepseek', choices: PROVIDER_IDS },
   { name: 'LM_STUDIO_URL', type: 'string' },
   { name: 'LM_STUDIO_MCP_BEARER_TOKEN', type: 'secret' },
   { name: 'WHISPER_SERVER_URLS', type: 'list' },
@@ -239,6 +241,8 @@ function loadConfig(env, { warn = msg => console.warn(msg) } = {}) {
   const config = {};
   for (const s of SETTINGS) {
     let raw = env[s.name];
+    // A typo must not select a paid default, even when other settings use warning/default recovery.
+    if (s.name === 'LLM_PROVIDER') { config[s.name] = selectProvider(raw); continue; }
     if ((raw === undefined || raw.trim() === '') && s.fallbackEnv) raw = env[s.fallbackEnv];
     if (raw === undefined || raw.trim() === '') {
       // An explicit empty log path disables persistence; omission keeps the default.
