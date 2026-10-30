@@ -72,6 +72,12 @@ module.exports = function boot(env = {}, overrides = {}, transport = null) {
   };
 
   const mods = {
+    './wake-settings': { createWakeSettings: () => { const values = new Map(); return {
+      get: id => ({ ...(values.get(id) || require('../wake-settings').DEFAULT_WAKE) }),
+      set: (id, value) => { require('../wake-settings').validatePhrase(value.phrase); values.set(id, { ...value }); return { ...value }; },
+      reset: id => { values.delete(id); return { ...require('../wake-settings').DEFAULT_WAKE }; },
+    }; } },
+    './wake-commands': require(path.join(LUNA_DIR, 'wake-commands.js')),
     './music-catalog': require(path.join(LUNA_DIR, 'music-catalog.js')),
     './music-engine': require(path.join(LUNA_DIR, 'music-engine.js')),
     './music-commands': require(path.join(LUNA_DIR, 'music-commands.js')),

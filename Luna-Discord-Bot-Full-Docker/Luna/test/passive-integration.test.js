@@ -49,9 +49,11 @@ test('production Whisper → adapter → streaming → existing TTS/player runs 
   assert.equal(h.S.llmRequests[1].messages.length, 2, 'old API history must not bypass rolling expiration');
   h.T.conversation.leave();
 });
-test('name anywhere and name alone each reach one bounded response without enabling nameless follow-ups', async () => {
+test('explicit anywhere mode and bare name each reach one bounded response without enabling nameless follow-ups', async () => {
   const h = fixture({ requestLimit: 3 }); await join(h);
   try {
+    await h.T.client.listeners('interactionCreate')[0]({ isChatInputCommand: () => true, commandName: 'wake',
+      guildId: 'g', user: { id: 'computer' }, options: { getSubcommand: () => 'mode', getString: () => 'anywhere' }, reply: async () => {} });
     for (const [i, text] of ['请大肥鱼介绍一下自己', '他说大肥鱼，退出频道', '大肥鱼'].entries()) {
       await say(h, text);
       await h.until(() => h.S.played.length === i + 1 && h.T.conversation.state === 'PASSIVE_LISTENING');

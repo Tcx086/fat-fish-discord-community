@@ -9,7 +9,8 @@ test('all required voice phrases are deterministic and ordinary background menti
   for (const [phrase, action] of [['放首歌', 'play'], ['播放晴天', 'play'], ['下一首', 'skip'], ['暂停音乐', 'pause'],
     ['继续播放', 'resume'], ['停止音乐', 'stop'], ['现在放的是什么歌？', 'now-playing'], ['这是什么歌？', 'now-playing']]) {
     assert.equal(invocation(`大肥鱼，${phrase}`).music.action, action); assert.equal(invocation(phrase), null);
-    assert.equal(invocation(`他说大肥鱼，${phrase}`).music, undefined);
+    assert.equal(invocation(`他说大肥鱼，${phrase}`), null);
+    assert.equal(invocation(`他说大肥鱼，${phrase}`, { phrase: '大肥鱼', mode: 'anywhere' }).music, undefined);
   }
   assert.equal(invocation('大肥鱼，暂停').action, 'pause'); assert.equal(invocation('大肥鱼，别说了').action, 'interrupt');
   assert.equal(invocation('大肥鱼，退出频道').action, 'leave'); assert.equal(invocation('大肥鱼，停止音乐').action, null);

@@ -34,14 +34,19 @@ test('direct-address matching accepts specified name forms, spacing, punctuation
     assert.ok(invocation(s), s);
   assert.equal(invocation('嘿，大肥鱼。').question, '嘿,大肥鱼。');
 });
-test('name anywhere including references and quotations invokes; unrelated names and oversized inputs do not', () => {
+test('direct default rejects references; explicit anywhere accepts unquoted mentions only', () => {
+  const anywhere = { phrase: '大肥鱼', mode: 'anywhere' };
   for (const s of ['我刚才看到一个大肥鱼的视频。', '这个机器人的名字是大肥鱼。', '你知道大肥鱼是什么吗？',
     '大肥鱼的视频很有趣', '大肥鱼是一个名字', '大肥鱼介绍的视频很好看', '大肥魚介紹了這個遊戲',
-    '“大肥鱼，你觉得呢？”', '请大肥鱼介绍一下自己', '大肥鱼介绍一下自己'])
-    assert.ok(invocation(s), s);
-  assert.equal(invocation('请大肥鱼介绍一下自己').question, '请大肥鱼介绍一下自己');
-  for (const s of ['大飞鱼，你怎么看？', 'a'.repeat(2000) + '大肥鱼', '介绍一下自己'])
+    '请大肥鱼介绍一下自己']) {
     assert.equal(invocation(s), null, s);
+    assert.ok(invocation(s, anywhere), s);
+  }
+  assert.equal(invocation('请大肥鱼介绍一下自己', anywhere).question, '请大肥鱼介绍一下自己');
+  for (const s of ['大飞鱼，你怎么看？', 'a'.repeat(2000) + '大肥鱼', '介绍一下自己', '“大肥鱼，你觉得呢？”']) {
+    assert.equal(invocation(s), null, s);
+    assert.equal(invocation(s, anywhere), null, s);
+  }
 });
 test('addressed controls are exact and deterministic', () => {
   assert.equal(invocation('大肥鱼，停。').action, 'interrupt');
@@ -50,7 +55,7 @@ test('addressed controls are exact and deterministic', () => {
   assert.equal(invocation('大肥鱼，暂停。').action, 'pause');
   assert.equal(invocation('大肥鱼，停止了吗？').action, null);
   for (const s of ['请不要让大肥鱼停下来', '他说大肥鱼，退出频道', '“大肥鱼，暂停”'])
-    assert.equal(invocation(s).action, null);
+    assert.equal(invocation(s), null);
 });
 test('ordinary bilingual human conversation only populates local context, never responds or emits text diagnostics', async () => {
   const f = setup(); await f.say('I think we should play League tonight.'); await f.say('但是我们只有三个人', 'b');

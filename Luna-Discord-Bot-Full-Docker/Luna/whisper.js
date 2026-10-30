@@ -47,7 +47,8 @@ function createWhisper({ config, fetch, console, initialPrompt = '' }) {
       form.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
       form.append('response_format', 'json');
       // Native Windows argv may replace Chinese with '?'; multipart preserves UTF-8.
-      if (initialPrompt) form.append('prompt', initialPrompt);
+      const prompt = typeof initialPrompt === 'function' ? initialPrompt() : initialPrompt;
+      if (prompt) form.append('prompt', prompt);
       if (language !== undefined) {
         if (!['auto', 'zh', 'en'].includes(language) || translate !== false) throw new Error('Invalid local transcription mode');
         form.append('language', language);

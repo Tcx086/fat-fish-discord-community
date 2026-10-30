@@ -47,6 +47,8 @@ const { loadMusicConfig, createMusicCatalog } = require('./music-catalog');
 const { createMusicEngine } = require('./music-engine');
 const { createAudioCoordinator } = require('./audio-coordinator');
 const { createMusicCommands, commandDefinition: musicCommandDefinition } = require('./music-commands');
+const { createWakeSettings } = require('./wake-settings');
+const { createWakeCommands, commandDefinition: wakeCommandDefinition } = require('./wake-commands');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -54,6 +56,7 @@ const { createMusicCommands, commandDefinition: musicCommandDefinition } = requi
 const config = loadConfig(process.env, { warn: message => console.warn(message) });
 const conversationConfig = loadConversationConfig(process.env);
 const passiveMode = conversationConfig.enabled && conversationConfig.mode === 'passive';
+const wakeSettings = passiveMode ? createWakeSettings() : null;
 const dynamicVoice = passiveMode && conversationConfig.dynamicChannels;
 const musicConfig = loadMusicConfig(process.env);
 const musicCatalog = musicConfig.enabled ? createMusicCatalog(musicConfig) : null;
@@ -220,7 +223,8 @@ const listener = createListener({
 setInterval(() => listener.healthReport(), 30000).unref?.();
 
 // Speech to text (whisper.js).
-const whisper = createWhisper({ config, fetch, console, initialPrompt: passiveMode ? '大肥鱼。' : '' });
+const whisper = createWhisper({ config, fetch, console,
+  initialPrompt: passiveMode ? () => wakeSettings.get(conversationConfig.guildId).phrase + '。' : '' });
 if (conversationConfig.enabled) {
   const eligible = id => {
     const channel = session.channel;
@@ -229,6 +233,7 @@ if (conversationConfig.enabled) {
     return speechAllowed(id) && (!passiveMode || notified.has(id)) && (!dynamicVoice || authorizedVoiceChannel(channel)) && !!member && !member.user.bot;
   };
   conversation = (passiveMode ? createPassiveListener : createConversation)({ ...conversationConfig, isAuthorized: eligible,
+    getWakeSettings: guildId => wakeSettings.get(guildId),
     beginSpeech: () => audioCoordinator?.beginSpeech() || (() => {}),
     musicCommand: musicCommands ? (command, userId) => {
       const content = musicCommands.voice(command, userId), connection = session.connection, owner = session.generation;
@@ -262,6 +267,9 @@ if (conversationConfig.enabled) {
   process.once?.('SIGINT', stopSharedProcess);
   process.once?.('SIGTERM', stopSharedProcess);
 }
+
+const handleWakeCommand = passiveMode ? createWakeCommands({ settings: wakeSettings, guildId: conversationConfig.guildId,
+  isOperator: isConversationOperator, onChange: () => conversation.command('clear') }) : null;
 
 function memoryCommandsFor(channelId) { const owner = session.generation; return createMemoryCommands({ engine: memoryEngine,
   guildId: conversationConfig.guildId, channelId,
@@ -308,7 +316,8 @@ function scheduleCapture(connection, channel, textChannel) {
 async function notifyListening(connection, channel, textChannel, participant) {
   const owner = conversation.generation, sessionOwner = session.generation;
   const recipients = [...channel.members.values()].filter(m => !m.user.bot && speechAllowed(m.id)).map(m => m.id);
-  const notice = '被动语音转写：本频道参与者的语音将在本地转写，临时上下文保留最近3分钟/40句；一句话中任何位置出现“大肥鱼”都会触发回复，包括聊天提及或只叫名字，并把有限相关上下文发给已启用的DeepSeek。没有名字时保持静默。/pause 暂停并清空临时上下文，/resume 恢复，/clear-context 清空临时上下文，/status 状态；/opt-out 退出转写并撤回持久化，/opt-in 重新加入临时转写；/stop 断开。不保存原始录音或后台转写日志。\n' + historyNotice(memoryEngine);
+  const wake = wakeSettings.get(channel.guild.id);
+  const notice = `被动语音转写：本频道参与者的语音将在本地转写，临时上下文保留最近3分钟/40句；唤醒词“${wake.phrase}”，匹配模式 ${wake.mode}（direct 为句首直接称呼，anywhere 允许句中提及；引号内不唤醒）。/wake show 查看当前设置。匹配后把有限相关上下文发给已启用的DeepSeek，未唤醒时保持静默。/pause 暂停并清空临时上下文，/resume 恢复，/clear-context 清空临时上下文，/status 状态；/opt-out 退出转写并撤回持久化，/opt-in 重新加入临时转写；/stop 断开。不保存原始录音或后台转写日志。\n` + historyNotice(memoryEngine);
   try {
     await channel.send({ content: participant ? `<@${participant}> ${notice}` : notice,
       allowedMentions: { parse: [], users: participant ? [participant] : [] } });
@@ -411,7 +420,10 @@ client.on(Events.ClientReady, async () => {
           { type: 7, name: 'channel', description: 'Destination voice channel', required: true, channel_types: [2] }] });
         await guild.commands.create({ name: 'leave', description: 'Disconnect and clear transient voice context' });
       }
-      if (passiveMode) await guild.commands.create(memoryCommandDefinition);
+      if (passiveMode) {
+        await guild.commands.create(memoryCommandDefinition);
+        await guild.commands.create(wakeCommandDefinition);
+      }
     } catch { console.warn('[conversation] Slash registration failed; text controls remain available'); }
   }
   console.log(`[search] web search: ${llm.describeSearch()}`);
@@ -419,12 +431,13 @@ client.on(Events.ClientReady, async () => {
   ready = true;
   checkAutoJoin();
   scheduleAutoJoin();
-  console.log(`Ready! Wake phrase: "${passiveMode ? '大肥鱼' : WAKE_LABEL}"  •  text command: ${BOT_COMMAND}`);
+  console.log(`Ready! Wake phrase: "${passiveMode ? wakeSettings.get(conversationConfig.guildId).phrase : WAKE_LABEL}"  •  text command: ${BOT_COMMAND}`);
 });
 
 // ─── Text commands ────────────────────────────────────────────────────────────
 
 client.on('interactionCreate', async interaction => {
+  if (handleWakeCommand && await handleWakeCommand(interaction)) return;
   if (musicCommands && await musicCommands.interaction(interaction)) return;
   if (interaction.isChatInputCommand?.() && handleFishText && await handleFishText(interaction)) return;
   if (!conversation || !interaction.isChatInputCommand?.()) return;
