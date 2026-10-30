@@ -4,7 +4,7 @@ $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'FatFish.ps1'))
 $testRoot = Join-Path $PSScriptRoot ('form-test-' + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
-    foreach ($case in @('save','no-autoload','legacy-key','bad-guild','bad-operator','missing-token','missing-key')) {
+    foreach ($case in @('save','repeat-save','no-autoload','legacy-key','bad-guild','bad-operator','missing-token','missing-key')) {
         $caseRoot = Join-Path $testRoot $case
         New-Item -ItemType Directory -Path $caseRoot | Out-Null
         $prefix = $caseRoot.Replace("'", "''")
@@ -24,6 +24,11 @@ Add-Type -TypeDefinition 'public static class FatFishFormTestMessages { public s
 `$repoRoot = '$prefix'
 `$settingsDirectory = Join-Path `$repoRoot 'private'
 `$env:LOCALAPPDATA = `$repoRoot
+if ('$case' -eq 'repeat-save') {
+    `$seed = [pscustomobject]@{ discordCipher=(Protect-Secret 'synthetic-initial'); enableDeepSeek=`$false }
+    Save-Settings `$seed
+    `$initialAcl = Get-Acl -LiteralPath `$settingsDirectory
+}
 `$boxes.discordCipher.Text = 'synthetic-must-not-leak'
 if ('$case' -eq 'bad-guild') { `$boxes.guildId.Text = 'invalid' }
 if ('$case' -eq 'bad-operator') { `$boxes.operatorIds.Text = 'invalid' }
@@ -39,12 +44,20 @@ if ('$case' -eq 'legacy-key') {
         $script = $script.Replace('try { [void]$form.ShowDialog() }', $setup + "`ntry { [void]`$form.ShowDialog() }")
         $script += @"
 `$file = Join-Path `$settingsDirectory 'settings.json'
-if ('$case' -in @('save','no-autoload','legacy-key')) {
+if ('$case' -in @('save','repeat-save','no-autoload','legacy-key')) {
     if (!(Test-Path -LiteralPath `$file)) { throw 'Actual Save button did not save.' }
     `$json = [IO.File]::ReadAllText(`$file)
     if (`$json.Contains('synthetic-must-not-leak')) { throw 'Plaintext persisted.' }
     if ((Unprotect-Secret ((`$json | ConvertFrom-Json).discordCipher)) -ne 'synthetic-must-not-leak') { throw 'Token roundtrip failed.' }
     `$saved = `$json | ConvertFrom-Json
+    `$acl = Get-Acl -LiteralPath `$settingsDirectory
+    `$expectedSids = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18')
+    if (!`$acl.AreAccessRulesProtected -or `$acl.Access.Count -ne 2) { throw 'Private directory permissions changed.' }
+    foreach (`$rule in `$acl.Access) {
+        `$sid = `$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if (`$sid -notin `$expectedSids -or `$rule.AccessControlType -ne 'Allow' -or `$rule.FileSystemRights -ne 'FullControl') { throw 'Unexpected private directory access.' }
+    }
+    if ('$case' -eq 'repeat-save' -and (`$acl.Owner -ne `$initialAcl.Owner -or `$acl.Group -ne `$initialAcl.Group)) { throw 'Saving changed directory ownership.' }
     if ('$case' -eq 'legacy-key') {
         Remove-Item -LiteralPath (Join-Path `$env:LOCALAPPDATA 'FatFish\credentials\deepseek.dpapi') -Force
         if ((Unprotect-Secret `$saved.deepseekCipher) -ne 'synthetic-deepseek-key') { throw 'Legacy key was not retained in settings.' }

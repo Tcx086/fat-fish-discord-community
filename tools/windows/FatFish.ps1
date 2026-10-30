@@ -18,7 +18,8 @@ function Initialize-PrivateDirectory([string]$Directory) {
     foreach ($sid in @([Security.Principal.WindowsIdentity]::GetCurrent().User, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
         $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
     }
-    Set-Acl -LiteralPath $Directory -AclObject $acl
+    # Set-Acl also retries audit metadata on protected folders; persist only the changed DACL.
+    [IO.Directory]::SetAccessControl($Directory, $acl)
 }
 function Protect-Secret([string]$Value) {
     $secret = ConvertTo-SecureString $Value -AsPlainText -Force
@@ -35,12 +36,14 @@ function Get-DeepSeekCipher($Settings) {
     return ''
 }
 function Assert-SavedCredentials($Settings) {
-    $ciphers = @($Settings.discordCipher)
-    if ($Settings.enableDeepSeek) { $ciphers += (Get-DeepSeekCipher $Settings) }
-    foreach ($cipher in $ciphers) {
-        if ([string]::IsNullOrWhiteSpace($cipher)) { throw 'Missing saved credential. Open Configure-FatFish.cmd and fill the required Token/Key.' }
-        $secret = ConvertTo-SecureString $cipher
-        try { if ($secret.Length -eq 0) { throw 'Saved credential is empty.' } } finally { $secret.Dispose() }
+    $required = @(@{ name='Discord Bot Token'; cipher=$Settings.discordCipher })
+    if ($Settings.enableDeepSeek) { $required += @{ name='DeepSeek API Key'; cipher=(Get-DeepSeekCipher $Settings) } }
+    foreach ($credential in $required) {
+        try {
+            if ([string]::IsNullOrWhiteSpace($credential.cipher)) { throw 'Missing credential.' }
+            $secret = ConvertTo-SecureString $credential.cipher
+            try { if ($secret.Length -eq 0) { throw 'Empty credential.' } } finally { $secret.Dispose() }
+        } catch { throw "Saved $($credential.name) is missing or unreadable. Open Configure-FatFish.cmd and save it under this Windows account." }
     }
 }
 function Save-Settings($Settings, [string]$Directory = $settingsDirectory) {
@@ -119,6 +122,15 @@ if ($Action -eq 'Start') {
     if (!(Test-Path -LiteralPath $settingsFile)) { & $PSCommandPath -Action Configure }
     if (!(Test-Path -LiteralPath $settingsFile)) { return }
     $settings = Read-Settings
+    try { Assert-SavedCredentials $settings } catch {
+        Write-Warning '已保存的凭据不完整或当前 Windows 账户无法读取。请在配置窗口重新填写缺少的 Token / Key 并保存；取消不会启动服务。'
+        & $PSCommandPath -Action Configure
+        $settings = Read-Settings
+        try { Assert-SavedCredentials $settings } catch {
+            Write-Warning '所需凭据仍未保存或无法读取，本次未启动。请重新运行配置后再启动。'
+            return
+        }
+    }
     $mutex = [Threading.Mutex]::new($false, 'Local\FatFishDesktopBot')
     $locked = $false
     try {
