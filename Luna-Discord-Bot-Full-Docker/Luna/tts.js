@@ -299,7 +299,7 @@ function createTTS({ config, fetch, console, fs = null, onBodyChunk = () => {} }
   }
 
   // A local server with Kokoro's /v1/audio/speech API (WAV).
-  function localProvider(name, url, voice, stream, timeoutMs, { tags = null, aliases = {}, tagPrompt = '' } = {}) {
+  function localProvider(name, url, voice, stream, timeoutMs, { tags = null, aliases = {}, tagPrompt = '', slots = null } = {}) {
     return {
       name,
       tagPrompt,
@@ -307,11 +307,16 @@ function createTTS({ config, fetch, console, fs = null, onBodyChunk = () => {} }
       configured: () => Boolean(url),
       voiceKey: () => `${name}/${voice || 'default'}/${url}`,
       async synthesize(text, signal, metadata = {}) {
-        const res = await request(name, url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ input: text, voice, stream, ...metadata }),
-        }, timeoutMs, signal);
+        const release = slots ? await slots.acquire(signal, timeoutMs) : null;
+        let res;
+        try {
+          if (slots && signal?.aborted) throw new TTSError(`${name} request cancelled`, 'cancelled');
+          res = await request(name, url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ input: text, voice, stream, ...metadata }),
+          }, timeoutMs, signal);
+        } finally { release?.(); }
         if (!res.ok) {
           const body = await res.text();
           // A voice that isn't installed fails every sentence until the config
@@ -325,7 +330,9 @@ function createTTS({ config, fetch, console, fs = null, onBodyChunk = () => {} }
   }
 
   const kokoro = localProvider('Kokoro', KOKORO_URL, KOKORO_VOICE, true, KOKORO_TIMEOUT_MS);
-  const feiyu = localProvider('Feiyu cute', config.FEIYU_TTS_URL, 'cute', false, config.FEIYU_TTS_TIMEOUT_MS);
+  // Buffered Feiyu headers mean synthesis finished; one in-flight request preserves this client's order.
+  const feiyu = localProvider('Feiyu cute', config.FEIYU_TTS_URL, 'cute', false, config.FEIYU_TTS_TIMEOUT_MS,
+    { slots: createLimiter(1, 'Feiyu') });
   const qwen3  = localProvider('Qwen3-TTS', QWEN3_TTS_URL, QWEN3_TTS_VOICE, QWEN3_TTS_STREAM, QWEN3_TTS_TIMEOUT_MS);
   const chatterbox = localProvider('Chatterbox', CHATTERBOX_URL, CHATTERBOX_VOICE, CHATTERBOX_STREAM, CHATTERBOX_TIMEOUT_MS, {
     tags: new Set([...CHATTERBOX_EMOTIONS, ...CHATTERBOX_SOUNDS]), aliases: CHATTERBOX_ALIASES, tagPrompt: CHATTERBOX_PROMPT,
